@@ -207,4 +207,15 @@ else
   fail_case "docs must name scripts/gh-api (AGENTS.md, README.md, cli-help-smoke.test)"
 fi
 
+printf '\n=== static: remote-timeouts-retries rule routes ad-hoc gh through gh-api ===\n'
+rule_local="${rh_root}/.cursor/rules/remote-timeouts-retries.mdc"
+rule_template="${rh_root}/scripts/lib/repo-practices-cursor/remote-timeouts-retries.mdc"
+if grep -qF 'scripts/gh-api' "$rule_local" \
+  && grep -qF 'repository-helpers#608' "$rule_local" \
+  && diff -q "$rule_local" "$rule_template" >/dev/null; then
+  pass_case "remote-timeouts-retries.mdc (both copies) route ad-hoc gh through scripts/gh-api"
+else
+  fail_case "remote-timeouts-retries.mdc must name scripts/gh-api + #608 in both identical copies"
+fi
+
 test_summary "gh-api"

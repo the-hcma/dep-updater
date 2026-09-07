@@ -4955,6 +4955,92 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== unit: remote-timeouts-retries gh-api throttle guidance (repository-helpers#608) ===\n'
+gh_throttle_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    pre_608="$(cat <<EOF
+---
+description: structurally valid but predates the throttled-wrapper routing bullet
+alwaysApply: true
+---
+
+Set an explicit timeout on every remote call.
+Retries are for transient failures only (429, 503).
+Cap attempts and honor Retry-After.
+Do not retry non-idempotent writes without dedupe keys.
+Anti-pattern: while True unbounded retry loops.
+EOF
+)"
+    bare_mention="$(cat <<EOF
+---
+description: mentions the path but gives no routing directive
+alwaysApply: true
+---
+
+Set an explicit timeout on every remote call.
+Retries are for transient failures only (429, 503).
+Cap attempts and honor Retry-After.
+Do not retry non-idempotent writes without dedupe keys.
+Anti-pattern: while True unbounded retry loops.
+The scripts/gh-api helper exists in this org.
+EOF
+)"
+    decoy="$(cat <<EOF
+---
+description: forbids the throttled wrapper (negation-anchored)
+alwaysApply: true
+---
+
+Set an explicit timeout on every remote call.
+Retries are for transient failures only (429, 503).
+Cap attempts and honor Retry-After.
+Do not retry non-idempotent writes without dedupe keys.
+Anti-pattern: while True unbounded retry loops.
+Never route gh through scripts/gh-api; call gh api directly.
+EOF
+)"
+    template="$(cat "$2")"
+    if ! rp_remote_timeouts_retries_is_valid "$pre_608"; then
+      printf "pre_608_not_structurally_valid\n"; exit 1
+    fi
+    if rp_remote_timeouts_retries_has_gh_throttle_guidance "$pre_608"; then
+      printf "pre_608_false_positive\n"; exit 1
+    fi
+    if rp_remote_timeouts_retries_has_gh_throttle_guidance "$bare_mention"; then
+      printf "bare_mention_false_positive\n"; exit 1
+    fi
+    if rp_remote_timeouts_retries_has_gh_throttle_guidance "$decoy"; then
+      printf "negation_decoy_false_positive\n"; exit 1
+    fi
+    if ! rp_remote_timeouts_retries_has_gh_throttle_guidance "$template"; then
+      printf "template_missing_gh_api\n"; exit 1
+    fi
+    printf "ok\n"
+  ' bash "$lib" "${rh_root}/scripts/lib/repo-practices-cursor/remote-timeouts-retries.mdc"
+)" || gh_throttle_out="fail:${gh_throttle_out}"
+if [[ "$gh_throttle_out" == 'ok' ]]; then
+  printf '[PASS] remote-timeouts-retries: gh-api throttle guidance detected in template, absent pre-#608\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] remote-timeouts-retries: gh-api throttle predicate wrong (%s)\n' "$gh_throttle_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: remote-timeouts-retries gh-api throttle SUGGEST-during-rollout wiring ===\n'
+if grep -qF 'rp_remote_timeouts_retries_has_gh_throttle_guidance' "$lib" \
+  && grep -qF 'repository-helpers#608' "$lib" \
+  && grep -qF 'route ad-hoc gh through scripts/gh-api (repository-helpers#608)' "$lib" \
+  && grep -qF 'route gh through scripts/gh-api' "$lib"; then
+  printf '[PASS] remote-timeouts-retries: #608 gh-api SUGGEST + apply-fix wiring present\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] remote-timeouts-retries: missing #608 gh-api SUGGEST-during-rollout wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== functional: legacy wait-for-copilot-review rule fails ===\n'
 mock_dir="$(mktemp -d)"
 mock_bin="${mock_dir}/bin"
@@ -5401,10 +5487,14 @@ if [[ -f "$remote_timeouts_retries_rule" ]] \
   && grep -qiE 'Product-specific' "$remote_timeouts_retries_rule" \
   && ! grep -qF 'graph_timeout_seconds' "$remote_timeouts_retries_rule" \
   && ! grep -qF 'Microsoft Graph' "$remote_timeouts_retries_rule" \
+  && grep -qF 'scripts/gh-api' "$remote_timeouts_retries_rule" \
+  && grep -qF 'repository-helpers#608' "$remote_timeouts_retries_rule" \
   && grep -qiE 'alwaysApply:[[:space:]]*true' "$local_remote_timeouts_retries_rule" \
   && grep -qiE 'timeout' "$local_remote_timeouts_retries_rule" \
-  && grep -qiE 'retr(y|ies)' "$local_remote_timeouts_retries_rule"; then
-  printf '[PASS] remote-timeouts-retries template: timeouts + bounded retries (#570); org template not blumkin-specific\n'
+  && grep -qiE 'retr(y|ies)' "$local_remote_timeouts_retries_rule" \
+  && grep -qF 'scripts/gh-api' "$local_remote_timeouts_retries_rule" \
+  && diff -q "$remote_timeouts_retries_rule" "$local_remote_timeouts_retries_rule" >/dev/null; then
+  printf '[PASS] remote-timeouts-retries template: timeouts + bounded retries (#570) + gh-api routing (#608); dogfood copy in sync\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] remote-timeouts-retries template: missing or incomplete\n'
