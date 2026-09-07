@@ -550,7 +550,28 @@ else
 fi
 rm -rf "$ss_none_fix"
 
+printf '\n=== static: dev/secret-scan does not shadow a pinned gitleaks on PATH ===\n'
+# Regression: scripts/dev/secret-scan used to `export PATH="${CI_SECRET_SCAN_BIN_DIR}:$PATH"`
+# unconditionally, so a real ~/.cache gitleaks shadowed a deliberately stubbed one
+# on a dev machine (prec_run_secret_scan resolves the real dev script). Guard the
+# prepend on the resolved version, mirroring prec_run_secret_scan_in_session.
+dev_secret_scan="${script_dir}/../scripts/dev/secret-scan"
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'ci_secret_scan_installed_version' "$dev_secret_scan" \
+  && grep -qF 'GITLEAKS_VERSION:-${ci_secret_scan_version}' "$dev_secret_scan"; then
+  pass_case 'dev/secret-scan guards the CI_SECRET_SCAN_BIN_DIR PATH prepend on the resolved version'
+else
+  fail_case 'dev/secret-scan must not unconditionally prepend CI_SECRET_SCAN_BIN_DIR (shadows a stubbed/pinned gitleaks)'
+fi
+
 printf '\n=== prec_run_secret_scan leak failure (stub gitleaks) ===\n'
+# Machine-independent on two fronts:
+#  - REPOSITORY_HELPERS_DIR pins prec_resolve_secret_scan_dev_script to THIS
+#    checkout's scripts/dev/secret-scan, not an arbitrary ~/work/ai clone that may
+#    lag the fix under test.
+#  - The stub gitleaks reports the pinned version, so neither
+#    prec_run_secret_scan_in_session nor scripts/dev/secret-scan may prepend
+#    ~/.cache ahead of it (see the static guard above).
 ss_run_fix="$(mktemp -d "${TMPDIR:-/tmp}/prec-ss-run.XXXXXX")"
 make_git_fixture "$ss_run_fix"
 mkdir -p "${ss_run_fix}/.github/ci" "${ss_run_fix}/stub-bin"
@@ -584,7 +605,8 @@ chmod +x "${ss_run_fix}/stub-bin/gitleaks"
 ss_run_out=""
 ss_run_rc=0
 ss_run_out="$(
-  PATH="${ss_run_fix}/stub-bin:${PATH}" \
+  REPOSITORY_HELPERS_DIR="$rh_root" \
+    PATH="${ss_run_fix}/stub-bin:${PATH}" \
     prec_run_secret_scan "$ss_run_fix" 2>&1
 )" || ss_run_rc=$?
 if [[ "$ss_run_rc" -ne 0 ]] && grep -qF 'ERROR: SECRET_SCAN_LEAK' <<<"$ss_run_out"; then
