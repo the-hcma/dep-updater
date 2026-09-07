@@ -200,12 +200,25 @@ See [Development](#development).
 | `scripts/check-lockfile-drift` | Compare lockfiles to registry constraints (safe throwaway worktree) |
 | `scripts/check-merge-settings` | Thin wrapper: merge + GitHub MQ checks only |
 | `scripts/check-token-expiry` | Preflight a CI environment PAT's expiry; warn before CI starts failing |
+| `scripts/gh-api` | Throttled `gh` passthrough for agent flows (primary/secondary rate-limit backoff) |
 | `scripts/grandfather-pnpm-release-age` | One-time pnpm `minimumReleaseAge` / exclude cutover for existing lockfiles |
 | `scripts/on-deploy` | Example deploy hook; consumer repos implement their own |
 | `scripts/trigger-agent-review` | Request a review from the configured agent profile |
 
 Shared libraries live under `scripts/lib/` (`agent-review`, `ci-secret-scan`,
 `on-deploy-deps`, `release-age-defaults`, `repo-practices`, `runner`, …).
+
+**`scripts/gh-api`** wraps a one-off `gh` call in the shared GitHub rate-limit
+backoff (`scripts/lib/github-api-rate-limit`): it reads `Retry-After` /
+`X-RateLimit-Reset`, sleeps until reset, and emits `NOTE: GITHUB_RATE_LIMIT_*`
+breadcrumbs — the same logic `wait-for-agent-review` / `github-repo-lint` use
+internally, so ad-hoc agent calls (`gh api`, `gh pr view`, posting a reply)
+survive a tripped secondary limiter instead of 403'ing. Args, stdin, stdout, and
+the exit code (including `125` for quota-intact fail-fast) pass straight through.
+Interactive `gh` (`auth`, prompts, `--web`) is rejected; `scripts/gh-api -- …`
+opts a non-listed subcommand in. Tune with `GITHUB_API_RATE_LIMIT_MAX_RETRIES`,
+`GITHUB_API_RATE_LIMIT_MAX_WAIT_S`, `GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST`,
+`GITHUB_API_SECONDARY_RATE_LIMIT_BACKOFF_S` (`scripts/gh-api --help`).
 
 ### Systemd / services
 

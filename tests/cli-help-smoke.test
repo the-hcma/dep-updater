@@ -27,6 +27,7 @@ cli_tools=(
   scripts/dev/ship-and-review
   scripts/dev/start-development
   scripts/dev/submit-stack
+  scripts/gh-api
   scripts/github-repo-lint
   scripts/grandfather-pnpm-release-age
   scripts/on-deploy
