@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# scripts/gh-api — run a one-off `gh` call through the shared GitHub rate-limit
+# backoff (scripts/lib/github-api-rate-limit).
+#
+# Coding agents: never call bare `gh api`, or a paginated / looped `gh` read or
+# write, directly in a triage / review flow. Route it through this wrapper so
+# primary AND secondary rate-limit waits are automatic
+# (github_api_exec_with_rate_limit_retry: reads Retry-After / X-RateLimit-Reset,
+# sleeps until reset, emits NOTE: GITHUB_RATE_LIMIT_* breadcrumbs). See
+# repository-helpers#608 and .cursor/rules/remote-timeouts-retries.mdc.
+#
+# Args, stdin, stdout, and the exit code pass straight through to `gh`. The
+# quota-intact fail-fast exit 125 (GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST)
+# is preserved so callers can tell "transient 403, quota intact" from a real
+# failure. On failure the runner prints a [FAIL] block (cmdline + captured
+# stderr + exit code) to stderr.
+#
+# Usage:
+#   scripts/gh-api api repos/OWNER/NAME/pulls --paginate
+#   scripts/gh-api pr view 5 --json state
+#   printf '{...}' | scripts/gh-api api repos/OWNER/NAME/issues --input -
+#   scripts/gh-api -- <any gh args>        # opt in a non-listed subcommand
+#   scripts/gh-api --print-label api rate_limit   # debug: show the NOTE: label
+#   scripts/gh-api --help
+#
+# Interactive `gh` (auth, prompts, editors, --web) is out of scope and rejected;
+# use the `--` / --passthrough escape hatch if you know a call is non-interactive.
+#
+# Environment (forwarded to scripts/lib/github-api-rate-limit):
+#   GITHUB_API_RATE_LIMIT_MAX_RETRIES            wait-and-retry cycles (default 3)
+#   GITHUB_API_RATE_LIMIT_MAX_WAIT_S             total wait budget per wait (default 3600)
+#   GITHUB_API_RATE_LIMIT_POLL_S                 sleep chunk while waiting (default 30)
+#   GITHUB_API_RATE_LIMIT_RETRY_SLEEP_S          fallback sleep when headers absent (default 60)
+#   GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST 1 => exit 125 on quota-intact REST 403
+#   GITHUB_API_SECONDARY_RATE_LIMIT_BACKOFF_S    secondary cooldown ladder (default 60,180,300)
+set -euo pipefail
+
+gh_api_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly gh_api_script_dir
+
+# shellcheck disable=SC1091  # runner-bootstrap begins the session for the rate-limit helper
+source "${gh_api_script_dir}/lib/runner-bootstrap"
+# shellcheck source=scripts/lib/github-api-rate-limit
+source "${gh_api_script_dir}/lib/github-api-rate-limit"
+
+# Subcommands that are interactive or unrelated to API throttling.
+readonly -a gh_api_rejected_subcommands=(
+  alias
+  auth
+  browse
+  codespace
+  config
+  extension
+  gist
+)
+
+usage() {
+  runner_sh_stdout "gh-api usage" -- \
+    "sed -n '2,35p' $(printf '%q' "${BASH_SOURCE[0]}") | sed 's/^# \{0,1\}//'"
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+# reject_interactive <reason> <argv…>
+# Print why the call was rejected plus the passthrough escape hatch, then exit 2.
+reject_interactive() {
+  local -r reason="$1"
+  shift
+  printf 'ERROR: gh-api: refusing a likely-interactive gh call: %s\n' "$reason" >&2
+  printf 'ERROR: gh-api: if this call is non-interactive, opt in with:\n' >&2
+  printf 'ERROR: gh-api:   scripts/gh-api -- %s\n' "$*" >&2
+  exit 2
+}
+
+# gh_api_positionals <gh-argv…>
+# Prints the positional args (subcommand, verb, …) one per line, dropping option
+# tokens and the values of gh's argument-taking *persistent* flags (the only ones
+# that can legally sit before the subcommand: `-R`/`--repo`, `--hostname`,
+# `--config`). Used to resolve the real subcommand regardless of flag order —
+# `gh -R o/r pr view 5` and `gh pr view -R o/r 5` both yield `pr` then `view`.
+# Per-command value flags (`-X`, `--jq`, `-f`, `-H`, …) can only appear *after*
+# the subcommand, so they never displace it here; the api-endpoint label uses a
+# shape match (gh_api_looks_like_endpoint) rather than trusting position.
+gh_api_positionals() {
+  local arg skip_value=0
+  for arg in "$@"; do
+    if (( skip_value )); then
+      skip_value=0
+      continue
+    fi
+    case "$arg" in
+      -R | --repo | --hostname | --config) skip_value=1 ;;
+      -*) : ;;
+      *) printf '%s\n' "$arg" ;;
+    esac
+  done
+}
+
+# gh_api_looks_like_endpoint <token>
+# True for a `gh api` endpoint path (`repos/o/r/pulls`, `repos/o/r?state=open`,
+# `/user`, `graphql`, `rate_limit`) — not an HTTP method, jq program,
+# `key=value` field, or flag.
+gh_api_looks_like_endpoint() {
+  local -r token="${1%%\?*}"
+  case "$token" in
+    '' | -* | *=* | *'|'* | '.'* | '['* | '{'* | "'"*) return 1 ;;
+    GET | POST | PUT | PATCH | DELETE | HEAD) return 1 ;;
+  esac
+  [[ "$token" == 'graphql' || "$token" == /* || "$token" =~ ^[A-Za-z0-9_.@-]+(/|$) ]]
+}
+
+# gh_api_derive_label <gh-argv…>
+# NOTE:-line label for github_api_exec_with_rate_limit_retry. `api <endpoint>`
+# keeps the endpoint (query string stripped); other subcommands use "<sub>-<verb>".
+gh_api_derive_label() {
+  local sub token
+  local -a pos=()
+  local seen_sub=0
+
+  mapfile -t pos < <(gh_api_positionals "$@")
+  sub="${pos[0]:-gh}"
+
+  if [[ "$sub" == 'api' ]]; then
+    # Endpoint by shape, not position — a value flag (`--method POST`, `--jq .x`)
+    # before the path would otherwise displace it in the label.
+    for token in "${pos[@]}"; do
+      if (( ! seen_sub )); then
+        [[ "$token" == 'api' ]] && seen_sub=1
+        continue
+      fi
+      if gh_api_looks_like_endpoint "$token"; then
+        printf 'gh-api:%s' "${token%%\?*}"
+        return 0
+      fi
+    done
+    printf 'gh-api:api'
+    return 0
+  fi
+
+  if [[ -n "${pos[1]:-}" ]]; then
+    printf 'gh-api:%s-%s' "$sub" "${pos[1]}"
+  else
+    printf 'gh-api:%s' "$sub"
+  fi
+}
+
+# gh_api_reads_stdin <gh-argv…>
+# True when the call explicitly asks gh to read stdin (a bare `-` sentinel, or a
+# `--flag=-` form for --input / --body-file / --notes-file). Anything else must
+# NOT buffer stdin — a bare `[[ ! -t 0 ]]` would block on `cat` when the caller
+# left the parent's stdin open without meaning to feed gh.
+gh_api_reads_stdin() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      - | --input=- | --body-file=- | --notes-file=-) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# gh_api_assert_scripted <gh-argv…>
+# Reject the calls that would hang an agent: no subcommand, a browser/editor/
+# prompt-only subcommand (`auth`, `browse`, `config`, `gist`, …) resolved past any
+# leading global flags, or `--web` anywhere. gh itself refuses to prompt without a
+# TTY (it errors, it does not hang) for `pr create` / `pr merge` etc., so those
+# are left to gh's own non-interactive error; `scripts/gh-api -- …` is the opt-in
+# for anything this rejects.
+gh_api_assert_scripted() {
+  local arg sub rejected
+  local -a pos=()
+
+  mapfile -t pos < <(gh_api_positionals "$@")
+  sub="${pos[0]:-}"
+
+  if [[ -z "$sub" ]]; then
+    printf 'ERROR: gh-api: no gh subcommand given\n' >&2
+    usage
+    exit 2
+  fi
+
+  for rejected in "${gh_api_rejected_subcommands[@]}"; do
+    if [[ "$sub" == "$rejected" ]]; then
+      reject_interactive "'gh ${sub}' is interactive or unrelated to API throttling" "$@"
+    fi
+  done
+
+  for arg in "$@"; do
+    if [[ "$arg" == '--web' ]]; then
+      reject_interactive "--web opens a browser" "$@"
+    fi
+  done
+}
+
+gh_api_main() {
+  local passthrough=0 print_label=0
+  local label stdin_file='' rc=0
+
+  while (( $# > 0 )); do
+    case "$1" in
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      --print-label)
+        print_label=1
+        shift
+        ;;
+      -p | --passthrough)
+        passthrough=1
+        shift
+        ;;
+      --)
+        passthrough=1
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if (( $# == 0 )); then
+    printf 'ERROR: gh-api: no gh arguments given\n' >&2
+    usage
+    exit 2
+  fi
+
+  if (( passthrough == 0 )); then
+    gh_api_assert_scripted "$@"
+  fi
+
+  label="$(gh_api_derive_label "$@")"
+
+  if (( print_label == 1 )); then
+    printf '%s\n' "$label"
+    exit 0
+  fi
+
+  # The rate-limit helper runs `gh` backgrounded inside runner_exec, which
+  # detaches stdin — a piped payload would be lost. So this stdin capture is
+  # deliberately *outside* the runner: buffer the payload to a temp file and feed
+  # `gh` from it via a redirect. A runner helper here would read from /dev/null.
+  # The file also survives a rate-limit retry (a consumed pipe would not). The
+  # bare mktemp/rm match scratch-file usage across scripts/lib/ (e.g.
+  # github-api-rate-limit, repo-practices) and are not tracked by the
+  # runner-adoption ratchet. On success the helper replays the winning attempt's
+  # stdout once; on failure it returns gh's exit code (125 preserved).
+  if [[ ! -t 0 ]] && gh_api_reads_stdin "$@"; then
+    stdin_file="$(mktemp "${TMPDIR:-/tmp}/gh-api-stdin.XXXXXX")"
+    cat >"$stdin_file"
+  fi
+
+  if [[ -n "$stdin_file" ]]; then
+    # `bash -c 'exec "$@" <"$0"' <stdin-file> gh <args…>` → `exec gh <args> < file`.
+    # The redirect is re-applied on each rate-limit retry (a pipe could not be).
+    # shellcheck disable=SC2016  # $@/$0 must be evaluated by the inner bash, not here
+    github_api_exec_with_rate_limit_retry "$label" -- \
+      bash -c 'exec "$@" <"$0"' "$stdin_file" gh "$@" || rc=$?
+    rm -f "$stdin_file"
+    exit "$rc"
+  fi
+
+  # Keep `gh` on this line (runner-adoption ratchet).
+  github_api_exec_with_rate_limit_retry "$label" -- gh "$@"
+}
+
+# Allow `source scripts/gh-api` in tests to unit-test the pure helpers.
+if ! (return 0 2>/dev/null); then
+  gh_api_main "$@"
+fi

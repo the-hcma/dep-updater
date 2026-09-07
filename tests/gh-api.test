@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# Smoke, functional, and static tests for scripts/gh-api (repository-helpers#608).
+#
+# Deterministic: mock `gh` on PATH, RUNNER_SESSION_ROOT in a tmpdir, no network.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
+# shellcheck disable=SC1091  # shared test helper sourced at runtime; CI shellcheck doesn't use -x
+source "${script_dir}/lib/test-assert"
+test_init
+
+script="${script_dir}/../scripts/gh-api"
+readonly script
+rh_root="${script_dir}/.."
+readonly rh_root
+
+# make_mock_gh <dir> — a mock `gh` that echoes its args, streams any explicit
+# stdin, and maps a couple of well-known calls.
+make_mock_gh() {
+  local -r dir="$1"
+  mkdir -p "$dir"
+  cat >"${dir}/gh" <<'MOCK_GH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == "api rate_limit" ]]; then
+  printf '%s\n' '{"resources":{"core":{"remaining":5000},"graphql":{"remaining":5000},"search":{"remaining":30}}}'
+  exit 0
+fi
+if [[ "${1:-}" == "exit22" ]]; then
+  printf 'mock gh boom\n' >&2
+  exit 22
+fi
+if [[ "${GH_MOCK_MODE:-}" == "primary-403" ]]; then
+  printf 'HTTP 403: API rate limit exceeded\n' >&2
+  exit 1
+fi
+for a in "$@"; do
+  if [[ "$a" == "-" ]]; then
+    printf 'STDIN=[%s]\n' "$(cat)"
+    break
+  fi
+done
+printf 'gh-args: %s\n' "$*"
+MOCK_GH
+  chmod +x "${dir}/gh"
+}
+
+printf '\n=== --help ===\n'
+help_out=""
+help_exit=0
+help_out="$(bash "$script" --help 2>&1)" || help_exit=$?
+assert_exit_0 "--help" "$help_out" "$help_exit"
+assert_contains "--help names the tool" "$help_out" "gh-api"
+assert_contains "--help documents MAX_RETRIES knob" "$help_out" "GITHUB_API_RATE_LIMIT_MAX_RETRIES"
+assert_contains "--help documents fail-fast exit 125" "$help_out" "exit 125"
+assert_contains "--help documents the -- escape hatch" "$help_out" "scripts/gh-api -- "
+
+printf '\n=== --print-label derivation ===\n'
+label_out=""
+label_out="$(bash "$script" --print-label api repos/o/r/pulls?state=open 2>&1)"
+assert_contains "api endpoint label strips query string" "$label_out" "gh-api:repos/o/r/pulls"
+label_out="$(bash "$script" --print-label pr view 5 --json state 2>&1)"
+assert_contains "pr verb label" "$label_out" "gh-api:pr-view"
+label_out="$(bash "$script" --print-label -- issue list 2>&1)"
+assert_contains "passthrough still derives a label" "$label_out" "gh-api:issue-list"
+label_out="$(bash "$script" --print-label -R owner/repo pr view 5 2>&1)"
+assert_contains "label resolves the verb past a leading -R flag" "$label_out" "gh-api:pr-view"
+# A value flag before the endpoint must not displace it in the label.
+label_out="$(bash "$script" --print-label api --method POST repos/o/r/issues 2>&1)"
+assert_contains "api label is the endpoint, not the --method value" "$label_out" "gh-api:repos/o/r/issues"
+label_out="$(bash "$script" --print-label api --jq '.state' 'repos/o/r/pulls?state=open' 2>&1)"
+assert_contains "api label survives --jq value + query string" "$label_out" "gh-api:repos/o/r/pulls"
+
+printf '\n=== interactive guard ===\n'
+tmp="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${tmp}/rs"
+make_mock_gh "${tmp}/bin"
+
+guard_out=""
+guard_exit=0
+guard_out="$(PATH="${tmp}/bin:${PATH}" bash "$script" </dev/null 2>&1)" || guard_exit=$?
+assert_exit_nonzero "no args" "$guard_out" "$guard_exit"
+assert_contains "no args names gh-api" "$guard_out" "no gh arguments"
+
+guard_exit=0
+guard_out="$(PATH="${tmp}/bin:${PATH}" bash "$script" -R owner/repo </dev/null 2>&1)" || guard_exit=$?
+assert_exit_nonzero "only global flags, no subcommand" "$guard_out" "$guard_exit"
+assert_contains "missing subcommand message" "$guard_out" "no gh subcommand"
+
+guard_exit=0
+guard_out="$(PATH="${tmp}/bin:${PATH}" bash "$script" auth login </dev/null 2>&1)" || guard_exit=$?
+assert_exit_nonzero "auth login rejected" "$guard_out" "$guard_exit"
+assert_contains "auth rejection names the -- escape hatch" "$guard_out" "scripts/gh-api -- auth login"
+
+guard_exit=0
+guard_out="$(PATH="${tmp}/bin:${PATH}" bash "$script" -R owner/repo config get pager </dev/null 2>&1)" || guard_exit=$?
+assert_exit_nonzero "config rejected past a leading -R flag" "$guard_out" "$guard_exit"
+
+guard_exit=0
+guard_out="$(PATH="${tmp}/bin:${PATH}" bash "$script" --config /tmp/x auth status </dev/null 2>&1)" || guard_exit=$?
+assert_exit_nonzero "auth rejected past a value-taking --config flag" "$guard_out" "$guard_exit"
+
+guard_exit=0
+guard_out="$(PATH="${tmp}/bin:${PATH}" bash "$script" gist create </dev/null 2>&1)" || guard_exit=$?
+assert_exit_nonzero "gist rejected (editor)" "$guard_out" "$guard_exit"
+
+guard_exit=0
+guard_out="$(PATH="${tmp}/bin:${PATH}" bash "$script" pr view 5 --web </dev/null 2>&1)" || guard_exit=$?
+assert_exit_nonzero "--web rejected" "$guard_out" "$guard_exit"
+
+# Scripted create calls are NOT second-guessed — gh errors without a TTY, it does
+# not hang — so short/long flag mixes pass straight through to the mock.
+sc_exit=0
+sc_out="$(PATH="${tmp}/bin:${PATH}" bash "$script" pr create -t x -b y </dev/null 2>&1)" || sc_exit=$?
+assert_exit_0 "scripted pr create -t/-b is not rejected" "$sc_out" "$sc_exit"
+assert_contains "scripted pr create reaches gh" "$sc_out" "gh-args: pr create -t x -b y"
+
+# Escape hatch runs anything verbatim.
+esc_exit=0
+esc_out="$(PATH="${tmp}/bin:${PATH}" bash "$script" -- auth status </dev/null 2>&1)" || esc_exit=$?
+assert_exit_0 "-- escape hatch runs a rejected subcommand" "$esc_out" "$esc_exit"
+assert_contains "-- escape hatch reached gh" "$esc_out" "gh-args: auth status"
+
+rm -rf "$tmp"
+unset RUNNER_SESSION_ROOT
+
+printf '\n=== passthrough: stdout + exit code ===\n'
+tmp="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${tmp}/rs"
+make_mock_gh "${tmp}/bin"
+
+pt_exit=0
+pt_out="$(PATH="${tmp}/bin:${PATH}" bash "$script" api rate_limit </dev/null 2>&1)" || pt_exit=$?
+assert_exit_0 "api rate_limit passthrough" "$pt_out" "$pt_exit"
+assert_contains "stdout passes straight through" "$pt_out" '"remaining":5000'
+
+pt_exit=0
+pt_out="$(PATH="${tmp}/bin:${PATH}" bash "$script" -- exit22 </dev/null 2>&1)" || pt_exit=$?
+if [[ "$pt_exit" -eq 22 ]]; then
+  pass_case "gh exit code 22 passes straight through"
+else
+  printf '[FAIL] expected exit 22, got %s\n%s\n' "$pt_exit" "$pt_out" >&2
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== passthrough: explicit stdin is fed to gh (survives runner backgrounding) ===\n'
+si_exit=0
+si_out="$(printf 'PAYLOAD-BODY' | PATH="${tmp}/bin:${PATH}" bash "$script" api repos/o/r/issues --input - 2>&1)" || si_exit=$?
+assert_exit_0 "gh api --input - passthrough" "$si_out" "$si_exit"
+assert_contains "stdin body reached the mock gh" "$si_out" "STDIN=[PAYLOAD-BODY]"
+
+printf '\n=== a call without a stdin sentinel does not block on cat ===\n'
+nb_exit=0
+nb_out="$(printf 'IGNORED' | timeout 15 env PATH="${tmp}/bin:${PATH}" bash "$script" pr view 5 2>&1)" || nb_exit=$?
+assert_exit_0 "no-sentinel call completes (no cat hang)" "$nb_out" "$nb_exit"
+
+rm -rf "$tmp"
+unset RUNNER_SESSION_ROOT
+
+printf '\n=== quota-intact fail-fast preserves exit 125 ===\n'
+tmp="$(mktemp -d)"
+export RUNNER_SESSION_ROOT="${tmp}/rs"
+make_mock_gh "${tmp}/bin"
+
+ff_exit=0
+ff_out="$(GH_MOCK_MODE=primary-403 \
+  GITHUB_API_RATE_LIMIT_QUOTA_INTACT_FAIL_FAST=1 \
+  GITHUB_API_RATE_LIMIT_MAX_RETRIES=2 \
+  PATH="${tmp}/bin:${PATH}" timeout 30 bash "$script" api repos/o/r/pulls </dev/null 2>&1)" || ff_exit=$?
+if [[ "$ff_exit" -eq 125 ]]; then
+  pass_case "quota-intact REST 403 fail-fast exits 125"
+else
+  printf '[FAIL] expected exit 125, got %s\n%s\n' "$ff_exit" "$ff_out" >&2
+  fail=$(( fail + 1 ))
+fi
+assert_contains "fail-fast emits the QUOTA_INTACT breadcrumb" "$ff_out" "GITHUB_REST_403_QUOTA_INTACT"
+
+rm -rf "$tmp"
+unset RUNNER_SESSION_ROOT
+
+printf '\n=== static: routes through the shared rate-limit helper ===\n'
+# shellcheck disable=SC2016  # grepping for literal shell source, not expanding it
+if grep -qF 'lib/runner-bootstrap' "$script" \
+  && grep -qF 'lib/github-api-rate-limit' "$script" \
+  && grep -qF 'github_api_exec_with_rate_limit_retry "$label"' "$script" \
+  && grep -qF -- '-- gh "$@"' "$script"; then
+  pass_case "gh-api sources runner-bootstrap + github-api-rate-limit and wraps gh"
+else
+  fail_case "gh-api must source the helpers and wrap gh via github_api_exec_with_rate_limit_retry"
+fi
+
+printf '\n=== static: no bare gh invocation ===\n'
+if grep -nE '^[[:space:]]*gh[[:space:]/"]' "$script"; then
+  fail_case "gh-api has a bare gh line (runner-adoption ratchet)"
+else
+  pass_case "gh-api has no bare gh invocation"
+fi
+
+printf '\n=== static: docs name the tool ===\n'
+if grep -qF 'scripts/gh-api' "${rh_root}/AGENTS.md" \
+  && grep -qF 'gh-api' "${rh_root}/README.md" \
+  && grep -qF 'scripts/gh-api' "${rh_root}/tests/cli-help-smoke.test"; then
+  pass_case "AGENTS.md / README.md / cli-help-smoke name gh-api"
+else
+  fail_case "docs must name scripts/gh-api (AGENTS.md, README.md, cli-help-smoke.test)"
+fi
+
+test_summary "gh-api"
