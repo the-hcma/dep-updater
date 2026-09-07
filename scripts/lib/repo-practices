@@ -2624,6 +2624,31 @@ rp_remote_timeouts_retries_content_for_apply_fix() {
   rp_remote_timeouts_retries_template
 }
 
+# rp_remote_timeouts_retries_has_gh_throttle_guidance <text>
+# True when the rule tells agents to *route* ad-hoc `gh` calls *through*
+# `scripts/gh-api` (repository-helpers#608) — not merely a bare path mention, and
+# not a negation-anchored one ("never route gh through scripts/gh-api"), so a
+# decoy cannot pass. Mirrors the decoy handling in
+# rp_remote_timeouts_retries_is_valid. SUGGEST-only during the org roll-out; once
+# every consumer has adopted, fold this into rp_remote_timeouts_retries_is_valid
+# so a missing bullet FAILs --strict-onboarding.
+rp_remote_timeouts_retries_has_gh_throttle_guidance() {
+  local -r text="$1"
+  local tmp stripped
+
+  tmp="$(mktemp)"
+  printf '%s' "$text" >"$tmp"
+  stripped="$(runner_exec_stdout "repo-practices remote-timeouts strip negated gh-api" -- \
+    sed -E \
+    -e "s/(do[[:space:]]*(\\*\\*)?not(\\*\\*)?|don't|never|must[[:space:]]+not|avoid|forbid|may[[:space:]]+not)[[:space:][:punct:]][^.[:cntrl:]]{0,120}scripts\\/gh-api//Ig" \
+    "$tmp")"
+  rm -f "$tmp"
+
+  rp_text_probe_grep_iE 'repo-practices remote-timeouts gh-api throttle' \
+    'rout[a-z]*[[:space:][:punct:]][^.[:cntrl:]]{0,60}through[^.[:cntrl:]]{0,80}scripts\/gh-api' \
+    "$stripped"
+}
+
 # True when the cursor rule requires explicit timeouts on remote calls, bounded
 # retries for transient failures (Retry-After / cap / budget), and documents
 # anti-patterns (alwaysApply org rule).
@@ -2793,6 +2818,23 @@ rp_check_remote_timeouts_retries() {
   else
     rp_log_check_ok "$slug" 'remote-timeouts-retries cursor rule' \
       "$(rp_github_url "$slug" "/blob/main/${rp_remote_timeouts_retries_path}")"
+    if ! rp_remote_timeouts_retries_has_gh_throttle_guidance "$rule_text"; then
+      # repository-helpers#608 roll-out: the rule is structurally valid but does
+      # not yet route ad-hoc `gh` through scripts/gh-api. SUGGEST-only for now so
+      # the nightly enforcer stays green while consumers adopt; flip into
+      # rp_remote_timeouts_retries_is_valid once org-wide adoption completes
+      # (.cursor/rules/org-cursor-rule-rollout.mdc).
+      if [[ "$rp_apply_fix" -eq 1 ]]; then
+        rp_queue_candidate_file_fix "$slug" "$rp_remote_timeouts_retries_path" \
+          "$(rp_remote_timeouts_retries_content_for_apply_fix "$slug")" \
+          'sync-remote-timeouts-retries' \
+          'chore: sync remote-timeouts-retries cursor rule (route gh through scripts/gh-api)'
+      fi
+      if [[ "$rp_suggest" -eq 1 ]]; then
+        rp_log_suggest \
+          "${slug}: sync .cursor/rules/remote-timeouts-retries.mdc to route ad-hoc gh through scripts/gh-api (repository-helpers#608)"
+      fi
+    fi
   fi
 
   return "$repo_fail"
