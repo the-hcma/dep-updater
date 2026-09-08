@@ -119,7 +119,8 @@ Use `scripts/dev/ship-and-review --no-agent-review` when you only want submit + 
 Use `--no-submit --pr <n>` when the PR already exists (CI + loop only).
 Use `scripts/dev/submit-stack --no-wait-ci` only when CI monitoring is handled separately.
 
-Patch title/body if stale: `gh pr edit <n> --title … --body …`
+Patch title/body if stale: `scripts/gh-api pr edit <n> --title … --body …`
+(route ad-hoc `gh` through `scripts/gh-api` — see `.cursor/rules/github-api-throttle.mdc`).
 
 ## 3. Agent review loop (cycle + PR caps)
 

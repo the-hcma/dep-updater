@@ -20,6 +20,10 @@ files in every consumer (e.g. `agent-bootstrap`: `CLAUDE.md` / `.github/copilot-
 shims, templates under `scripts/lib/repo-practices-agents/`) — land helpers with the
 ratchet, pilot one consumer, roll org-wide, merge helpers last.
 
+A **breadcrumb-only** rule (consumer copy is a thin pointer + canonical URL, not a
+copied body — `stacking-tool`, `github-api-throttle`) follows the same process; the
+`rp_*_is_valid` consumer branch checks for the breadcrumb URL, not the full text.
+
 ## Operator / agent process (required)
 
 Drive rollout in this order. Do **not** fire-and-forget org-wide PRs.

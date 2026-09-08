@@ -4955,92 +4955,6 @@ else
   fail=$(( fail + 1 ))
 fi
 
-printf '\n=== unit: remote-timeouts-retries gh-api throttle guidance (repository-helpers#608) ===\n'
-gh_throttle_out="$(
-  bash -c '
-    set -euo pipefail
-    # shellcheck disable=SC1091
-    source "$1"
-    pre_608="$(cat <<EOF
----
-description: structurally valid but predates the throttled-wrapper routing bullet
-alwaysApply: true
----
-
-Set an explicit timeout on every remote call.
-Retries are for transient failures only (429, 503).
-Cap attempts and honor Retry-After.
-Do not retry non-idempotent writes without dedupe keys.
-Anti-pattern: while True unbounded retry loops.
-EOF
-)"
-    bare_mention="$(cat <<EOF
----
-description: mentions the path but gives no routing directive
-alwaysApply: true
----
-
-Set an explicit timeout on every remote call.
-Retries are for transient failures only (429, 503).
-Cap attempts and honor Retry-After.
-Do not retry non-idempotent writes without dedupe keys.
-Anti-pattern: while True unbounded retry loops.
-The scripts/gh-api helper exists in this org.
-EOF
-)"
-    decoy="$(cat <<EOF
----
-description: forbids the throttled wrapper (negation-anchored)
-alwaysApply: true
----
-
-Set an explicit timeout on every remote call.
-Retries are for transient failures only (429, 503).
-Cap attempts and honor Retry-After.
-Do not retry non-idempotent writes without dedupe keys.
-Anti-pattern: while True unbounded retry loops.
-Never route gh through scripts/gh-api; call gh api directly.
-EOF
-)"
-    template="$(cat "$2")"
-    if ! rp_remote_timeouts_retries_is_valid "$pre_608"; then
-      printf "pre_608_not_structurally_valid\n"; exit 1
-    fi
-    if rp_remote_timeouts_retries_has_gh_throttle_guidance "$pre_608"; then
-      printf "pre_608_false_positive\n"; exit 1
-    fi
-    if rp_remote_timeouts_retries_has_gh_throttle_guidance "$bare_mention"; then
-      printf "bare_mention_false_positive\n"; exit 1
-    fi
-    if rp_remote_timeouts_retries_has_gh_throttle_guidance "$decoy"; then
-      printf "negation_decoy_false_positive\n"; exit 1
-    fi
-    if ! rp_remote_timeouts_retries_has_gh_throttle_guidance "$template"; then
-      printf "template_missing_gh_api\n"; exit 1
-    fi
-    printf "ok\n"
-  ' bash "$lib" "${rh_root}/scripts/lib/repo-practices-cursor/remote-timeouts-retries.mdc"
-)" || gh_throttle_out="fail:${gh_throttle_out}"
-if [[ "$gh_throttle_out" == 'ok' ]]; then
-  printf '[PASS] remote-timeouts-retries: gh-api throttle guidance detected in template, absent pre-#608\n'
-  pass=$(( pass + 1 ))
-else
-  printf '[FAIL] remote-timeouts-retries: gh-api throttle predicate wrong (%s)\n' "$gh_throttle_out"
-  fail=$(( fail + 1 ))
-fi
-
-printf '\n=== static: remote-timeouts-retries gh-api throttle SUGGEST-during-rollout wiring ===\n'
-if grep -qF 'rp_remote_timeouts_retries_has_gh_throttle_guidance' "$lib" \
-  && grep -qF 'repository-helpers#608' "$lib" \
-  && grep -qF 'route ad-hoc gh through scripts/gh-api (repository-helpers#608)' "$lib" \
-  && grep -qF 'route gh through scripts/gh-api' "$lib"; then
-  printf '[PASS] remote-timeouts-retries: #608 gh-api SUGGEST + apply-fix wiring present\n'
-  pass=$(( pass + 1 ))
-else
-  printf '[FAIL] remote-timeouts-retries: missing #608 gh-api SUGGEST-during-rollout wiring\n'
-  fail=$(( fail + 1 ))
-fi
-
 printf '\n=== functional: legacy wait-for-copilot-review rule fails ===\n'
 mock_dir="$(mktemp -d)"
 mock_bin="${mock_dir}/bin"
@@ -5321,6 +5235,136 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== static: github-api-throttle check and apply-fix wiring (repository-helpers#608) ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text
+if grep -qF 'rp_check_github_api_throttle' "$lib" \
+  && grep -qF 'add-github-api-throttle-rule' "$lib" \
+  && grep -qF 'sync-github-api-throttle-rule' "$lib" \
+  && grep -qF 'rp_github_api_throttle_rule_template' "$lib" \
+  && grep -qF 'rp_github_api_throttle_rule_content_for_apply_fix' "$lib" \
+  && grep -qF 'rp_github_api_throttle_rule_is_valid' "$lib" \
+  && grep -qF '@@GH_API_THROTTLE_RULE_URL@@' "$lib" \
+  && grep -qF 'repo-practices-cursor/github-api-throttle.mdc' "$lib" \
+  && grep -qF 'if ! rp_check_github_api_throttle "$slug"; then' "$lib"; then
+  printf '[PASS] github-api-throttle: lint check, apply-fix wiring, and dispatch present\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] github-api-throttle: missing lint/apply-fix/dispatch wiring\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: github-api-throttle rule validator ===\n'
+gat_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    template="$(rp_github_api_throttle_rule_template)"
+    dogfood="$(cat "$2")"
+    # The consumer template is a thin pointer, NOT a copy of the fuller dogfood
+    # rule — they must differ.
+    if [[ "$template" == "$dogfood" ]]; then
+      printf "template_is_a_copy_of_dogfood\n"; exit 1
+    fi
+    if ! rp_github_api_throttle_rule_is_valid "$template" "the-hcma/some-consumer"; then
+      printf "consumer_template_rejected\n"; exit 1
+    fi
+    if ! rp_github_api_throttle_rule_is_valid "$dogfood" "the-hcma/repository-helpers"; then
+      printf "dogfood_rejected\n"; exit 1
+    fi
+    usage="\"\${REPOSITORY_HELPERS_DIR:-x}/scripts/gh-api\" <gh args>"
+    crumb="github-api-throttle-canonical: http://x"
+    body() { printf -- "---\nalwaysApply: true\n---\n%s\n%s\n" "$1" "$crumb"; }
+    if rp_github_api_throttle_rule_is_valid "$(printf -- "---\nalwaysApply: false\n---\nRun gh through scripts/gh-api. REPOSITORY_HELPERS_DIR\n%s\n" "$crumb")" "the-hcma/x"; then
+      printf "not_alwaysApply_accepted\n"; exit 1
+    fi
+    # Bare path mention with no imperative -> rejected (structural directive).
+    if rp_github_api_throttle_rule_is_valid "$(body "The scripts/gh-api helper exists; set REPOSITORY_HELPERS_DIR.")" "the-hcma/x"; then
+      printf "bare_mention_accepted\n"; exit 1
+    fi
+    # Permissive prose across lines must be caught (checks run on flattened text).
+    permissive="$(printf -- "---\ndescription: Run agent gh calls through repository-helpers/scripts/gh-api\nalwaysApply: true\n---\nAgents may call gh directly whenever they prefer. For rate-limit backoff, prefer\n%s.\n%s\n" "$usage" "$crumb")"
+    if rp_github_api_throttle_rule_is_valid "$permissive" "the-hcma/x"; then
+      printf "permissive_prose_accepted\n"; exit 1
+    fi
+    if rp_github_api_throttle_rule_is_valid "$(body "You may run gh through scripts/gh-api via REPOSITORY_HELPERS_DIR ${usage}, or call gh directly.")" "the-hcma/x"; then
+      printf "you_may_decoy_accepted\n"; exit 1
+    fi
+    if rp_github_api_throttle_rule_is_valid "$(body "Optionally route through ${usage} if you like. REPOSITORY_HELPERS_DIR")" "the-hcma/x"; then
+      printf "optional_route_decoy_accepted\n"; exit 1
+    fi
+    # A rule that only forbids the wrapper -> rejected.
+    if rp_github_api_throttle_rule_is_valid "$(body "Do not use scripts/gh-api. Run gh ${usage} directly. REPOSITORY_HELPERS_DIR")" "the-hcma/x"; then
+      printf "forbid_wrapper_decoy_accepted\n"; exit 1
+    fi
+    # "Never call gh directly; route every call through …" -> valid (forbids
+    # bare gh AND mandates the wrapper).
+    if ! rp_github_api_throttle_rule_is_valid "$(body "Never call gh directly; route every call through ${usage}. REPOSITORY_HELPERS_DIR")" "the-hcma/x"; then
+      printf "strict_phrasing_rejected\n"; exit 1
+    fi
+    if rp_github_api_throttle_rule_is_valid "$(printf -- "---\nalwaysApply: true\n---\nAgents must run gh through %s.\n" "$usage")" "the-hcma/consumer-x"; then
+      printf "consumer_missing_breadcrumb_accepted\n"; exit 1
+    fi
+    printf "ok\n"
+  ' bash "$lib" "${rh_root}/.cursor/rules/github-api-throttle.mdc"
+)" || gat_out="fail:${gat_out}"
+if [[ "$gat_out" == 'ok' ]]; then
+  printf '[PASS] github-api-throttle: validator accepts template + dogfood + strict phrasing; rejects copy / not-alwaysApply / bare mention / multi-line permissive prose / you-may / optional-route / forbid-wrapper / consumer missing breadcrumb\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] github-api-throttle: validator wrong (%s)\n' "$gat_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: github-api-throttle missing rule SUGGESTs, never FAILs (roll-out) ===\n'
+gat_suggest="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    rp_suggest=1
+    rp_apply_fix=0
+    rp_strict_onboarding=1
+    rp_new_repo=1
+    rp_fetch_github_text_file() { return 1; }
+    rp_repo_short_name() { printf "some-consumer\n"; }
+    rc=0
+    out="$(rp_check_github_api_throttle "the-hcma/some-consumer" 2>&1)" || rc=$?
+    printf "rc=%s\n" "$rc"
+    printf "%s\n" "$out"
+  ' bash "$lib"
+)"
+if grep -qF 'rc=0' <<<"$gat_suggest" \
+  && grep -qF 'add .cursor/rules/github-api-throttle.mdc' <<<"$gat_suggest" \
+  && grep -qF 'repository-helpers#608' <<<"$gat_suggest"; then
+  printf '[PASS] github-api-throttle: missing rule under --strict-onboarding/--new-repo is SUGGEST-only (exit 0)\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] github-api-throttle: missing rule should SUGGEST and return 0\n%s\n' "$gat_suggest"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== static: consumer github-api-throttle template is a thin breadcrumb ===\n'
+gat_tmpl="${rh_root}/scripts/lib/repo-practices-cursor/github-api-throttle.mdc"
+gat_local="${rh_root}/.cursor/rules/github-api-throttle.mdc"
+if [[ -f "$gat_tmpl" ]] && [[ -f "$gat_local" ]] \
+  && grep -qiE 'alwaysApply:[[:space:]]*true' "$gat_tmpl" \
+  && grep -qF 'scripts/gh-api' "$gat_tmpl" \
+  && grep -qF 'REPOSITORY_HELPERS_DIR' "$gat_tmpl" \
+  && grep -qF '@@GH_API_THROTTLE_RULE_URL@@' "$gat_tmpl" \
+  && grep -qF 'github-api-throttle-canonical:' "$gat_tmpl" \
+  && ! grep -qF '@@GH_API_THROTTLE_RULE_URL@@' "$gat_local" \
+  && grep -qF 'github.com/the-hcma/repository-helpers/blob/main/.cursor/rules/github-api-throttle.mdc' "$gat_local" \
+  && [[ "$(grep -cve '^[[:space:]]*$' "$gat_tmpl")" -le 18 ]] \
+  && ! grep -qF 'github_api_exec_with_rate_limit_retry' "$gat_tmpl" \
+  && grep -qF 'Canonical rule' "$gat_local"; then
+  printf '[PASS] consumer github-api-throttle template: thin breadcrumb (<=18 non-blank lines), URL placeholder, points at the canonical rule rather than restating it\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] consumer github-api-throttle template: missing, over-copied, or not a breadcrumb\n'
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== static: repo-practices-after-config-change check and apply-fix wiring ===\n'
 if grep -qF 'rp_check_repo_practices_after_config_change' "$lib" \
   && grep -qF 'add-repo-practices-after-config-change' "$lib" \
@@ -5487,14 +5531,10 @@ if [[ -f "$remote_timeouts_retries_rule" ]] \
   && grep -qiE 'Product-specific' "$remote_timeouts_retries_rule" \
   && ! grep -qF 'graph_timeout_seconds' "$remote_timeouts_retries_rule" \
   && ! grep -qF 'Microsoft Graph' "$remote_timeouts_retries_rule" \
-  && grep -qF 'scripts/gh-api' "$remote_timeouts_retries_rule" \
-  && grep -qF 'repository-helpers#608' "$remote_timeouts_retries_rule" \
   && grep -qiE 'alwaysApply:[[:space:]]*true' "$local_remote_timeouts_retries_rule" \
   && grep -qiE 'timeout' "$local_remote_timeouts_retries_rule" \
-  && grep -qiE 'retr(y|ies)' "$local_remote_timeouts_retries_rule" \
-  && grep -qF 'scripts/gh-api' "$local_remote_timeouts_retries_rule" \
-  && diff -q "$remote_timeouts_retries_rule" "$local_remote_timeouts_retries_rule" >/dev/null; then
-  printf '[PASS] remote-timeouts-retries template: timeouts + bounded retries (#570) + gh-api routing (#608); dogfood copy in sync\n'
+  && grep -qiE 'retr(y|ies)' "$local_remote_timeouts_retries_rule"; then
+  printf '[PASS] remote-timeouts-retries template: timeouts + bounded retries (#570); org template not blumkin-specific\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] remote-timeouts-retries template: missing or incomplete\n'

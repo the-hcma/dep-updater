@@ -2624,31 +2624,6 @@ rp_remote_timeouts_retries_content_for_apply_fix() {
   rp_remote_timeouts_retries_template
 }
 
-# rp_remote_timeouts_retries_has_gh_throttle_guidance <text>
-# True when the rule tells agents to *route* ad-hoc `gh` calls *through*
-# `scripts/gh-api` (repository-helpers#608) — not merely a bare path mention, and
-# not a negation-anchored one ("never route gh through scripts/gh-api"), so a
-# decoy cannot pass. Mirrors the decoy handling in
-# rp_remote_timeouts_retries_is_valid. SUGGEST-only during the org roll-out; once
-# every consumer has adopted, fold this into rp_remote_timeouts_retries_is_valid
-# so a missing bullet FAILs --strict-onboarding.
-rp_remote_timeouts_retries_has_gh_throttle_guidance() {
-  local -r text="$1"
-  local tmp stripped
-
-  tmp="$(mktemp)"
-  printf '%s' "$text" >"$tmp"
-  stripped="$(runner_exec_stdout "repo-practices remote-timeouts strip negated gh-api" -- \
-    sed -E \
-    -e "s/(do[[:space:]]*(\\*\\*)?not(\\*\\*)?|don't|never|must[[:space:]]+not|avoid|forbid|may[[:space:]]+not)[[:space:][:punct:]][^.[:cntrl:]]{0,120}scripts\\/gh-api//Ig" \
-    "$tmp")"
-  rm -f "$tmp"
-
-  rp_text_probe_grep_iE 'repo-practices remote-timeouts gh-api throttle' \
-    'rout[a-z]*[[:space:][:punct:]][^.[:cntrl:]]{0,60}through[^.[:cntrl:]]{0,80}scripts\/gh-api' \
-    "$stripped"
-}
-
 # True when the cursor rule requires explicit timeouts on remote calls, bounded
 # retries for transient failures (Retry-After / cap / budget), and documents
 # anti-patterns (alwaysApply org rule).
@@ -2818,26 +2793,171 @@ rp_check_remote_timeouts_retries() {
   else
     rp_log_check_ok "$slug" 'remote-timeouts-retries cursor rule' \
       "$(rp_github_url "$slug" "/blob/main/${rp_remote_timeouts_retries_path}")"
-    if ! rp_remote_timeouts_retries_has_gh_throttle_guidance "$rule_text"; then
-      # repository-helpers#608 roll-out: the rule is structurally valid but does
-      # not yet route ad-hoc `gh` through scripts/gh-api. SUGGEST-only for now so
-      # the nightly enforcer stays green while consumers adopt; flip into
-      # rp_remote_timeouts_retries_is_valid once org-wide adoption completes
-      # (.cursor/rules/org-cursor-rule-rollout.mdc).
-      if [[ "$rp_apply_fix" -eq 1 ]]; then
-        rp_queue_candidate_file_fix "$slug" "$rp_remote_timeouts_retries_path" \
-          "$(rp_remote_timeouts_retries_content_for_apply_fix "$slug")" \
-          'sync-remote-timeouts-retries' \
-          'chore: sync remote-timeouts-retries cursor rule (route gh through scripts/gh-api)'
-      fi
-      if [[ "$rp_suggest" -eq 1 ]]; then
-        rp_log_suggest \
-          "${slug}: sync .cursor/rules/remote-timeouts-retries.mdc to route ad-hoc gh through scripts/gh-api (repository-helpers#608)"
-      fi
-    fi
   fi
 
   return "$repo_fail"
+}
+
+readonly rp_github_api_throttle_rule_path='.cursor/rules/github-api-throttle.mdc'
+
+rp_github_api_throttle_rule_url() {
+  rp_github_url "${rp_DEFAULT_ORG}/${rp_THIS_REPO_NAME}" \
+    "/blob/main/${rp_github_api_throttle_rule_path}"
+}
+
+# The razor-thin `gh`-only cursor rule (repository-helpers#608): agent flows that
+# shell out to `gh` route it through scripts/gh-api so primary/secondary
+# rate-limit backoff is automatic. Consumers carry a breadcrumb copy (URL to the
+# canonical rule), not the copied body — same shape as stacking-tool.mdc.
+rp_github_api_throttle_rule_template() {
+  local path url
+
+  path="${rp_lib_dir}/repo-practices-cursor/github-api-throttle.mdc"
+  url="$(rp_github_api_throttle_rule_url)"
+  if [[ ! -f "$path" ]]; then
+    rp_die "internal error: missing cursor rule template: ${path}"
+  fi
+  runner_exec_stdout "repo-practices github-api-throttle template url" -- \
+    sed -e "s|@@GH_API_THROTTLE_RULE_URL@@|${url}|g" "$path"
+}
+
+# Always the breadcrumb template (URL-substituted). Unlike the fuller rules, the
+# repository-helpers dogfood copy is *not* the consumer artifact — consumers get
+# the thin pointer — so there is no "prefer local copy" branch here. Takes the
+# slug for call-site symmetry with the other *_content_for_apply_fix helpers.
+rp_github_api_throttle_rule_content_for_apply_fix() {
+  rp_github_api_throttle_rule_template
+}
+
+# True when the rule is alwaysApply, names scripts/gh-api reached via
+# REPOSITORY_HELPERS_DIR, mandates routing `gh` through the wrapper (does not
+# merely permit it or forbid it), and (for consumers) carries the canonical
+# breadcrumb URL. Prose checks run on newline-flattened text so a permissive
+# sentence cannot hide from `grep -E` on a separate physical line.
+rp_github_api_throttle_rule_is_valid() {
+  local -r text="$1"
+  local -r slug="${2:-}"
+  local tmp flat
+
+  if ! rp_text_probe_grep_iE 'repo-practices github-api-throttle alwaysApply' \
+    '^alwaysApply:[[:space:]]*true([[:space:]]|$)' "$text"; then
+    return 1
+  fi
+  if ! grep -qF 'scripts/gh-api' <<<"$text"; then
+    return 1
+  fi
+  if ! grep -qF 'REPOSITORY_HELPERS_DIR' <<<"$text"; then
+    return 1
+  fi
+
+  tmp="$(mktemp)"
+  printf '%s' "$text" >"$tmp"
+  flat="$(runner_exec_stdout "repo-practices github-api-throttle flatten" -- \
+    paste -sd ' ' "$tmp")"
+  rm -f "$tmp"
+
+  # Reject phrasing that PERMITS bare `gh` ("agents may call gh directly",
+  # "prefer scripts/gh-api … but gh is fine", "optionally route through …").
+  if rp_text_probe_grep_iE 'repo-practices github-api-throttle permissive decoy' \
+    '(may|can|allowed to|permitted to|feel free to|freely|optional(ly)?|prefer|if you (want|like|prefer)|whenever)[^.]{0,60}(call|run|use|invoke)[^.]{0,20}gh[^.]{0,20}(direct|bare|itself|yourself)|gh[^.]{0,20}(direct|bare)[^.]{0,80}(is[[:space:]]+(fine|ok|acceptable)|acceptable|permitted|allowed)|(optional(ly)?|you may)[^.]{0,40}(route|run|invoke)[^.]{0,40}(scripts/)?gh-api' \
+    "$flat"; then
+    return 1
+  fi
+  # Reject a rule that only *forbids* the wrapper ("do not use scripts/gh-api").
+  # Not one that forbids bare gh while mandating the wrapper ("never call gh
+  # directly; route every call through scripts/gh-api"): the negation must land
+  # on a use-verb directly before the path.
+  if rp_text_probe_grep_iE 'repo-practices github-api-throttle forbid-wrapper decoy' \
+    "(do not|don't|never|must not|avoid)[[:space:]]+(use|call|invoke|run|route)[[:space:]]+(the[[:space:]]+)?[\`']?(scripts/)?gh-api" \
+    "$flat"; then
+    return 1
+  fi
+  # A mandate tying an imperative (as a whole word — not "always" inside
+  # "alwaysApply") to the *wrapper path* "scripts/gh-api". The template
+  # frontmatter `description:` line ("Run agent gh calls through …
+  # scripts/gh-api") satisfies it, as does "route every call through
+  # scripts/gh-api".
+  if ! rp_text_probe_grep_iE 'repo-practices github-api-throttle directive' \
+    '(^|[^[:alnum:]])(run|route|through|via|must|always|shall)[^[:alnum:]][^.]{0,100}scripts/gh-api' \
+    "$flat"; then
+    return 1
+  fi
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    return 0
+  fi
+  # Consumers: breadcrumb comment or a github blob URL to the canonical rule.
+  grep -qE \
+    'github-api-throttle-canonical:|github\.com/[^/]+/'"${rp_THIS_REPO_NAME}"'/blob/[^/]+/\.cursor/rules/github-api-throttle\.mdc' \
+    <<<"$text"
+}
+
+# repository-helpers#608 roll-out: SUGGEST-only everywhere for now — a missing or
+# stale breadcrumb never sets repo_fail, even under --strict-onboarding /
+# --new-repo, so the nightly enforcer stays green while consumers adopt. Flip to
+# FAIL under --strict-onboarding / --new-repo once org-wide adoption completes
+# (see .cursor/rules/org-cursor-rule-rollout.mdc; same ratchet endpoint as
+# #570 / #588).
+rp_check_github_api_throttle() {
+  local slug="$1"
+  local rule_text fetch_ec=0 repo_dir local_path
+
+  if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
+    repo_dir="$(rp_resolve_local_repo_dir "$slug" || true)"
+    if [[ -n "$repo_dir" ]]; then
+      local_path="${repo_dir}/${rp_github_api_throttle_rule_path}"
+      if [[ -f "$local_path" ]]; then
+        rule_text="$(rp_runner_exec_stdout "repo-practices cat local github-api-throttle" -- \
+          cat "$local_path")"
+      fi
+    fi
+  fi
+  if [[ -z "${rule_text:-}" ]]; then
+    rule_text="$(rp_fetch_github_text_file "$slug" "$rp_github_api_throttle_rule_path")" \
+      || fetch_ec=$?
+  fi
+  if (( fetch_ec == 2 )); then
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: retry github-api-throttle rule check after GitHub API recovers"
+    else
+      rp_log_warn \
+        "${slug}: could not read ${rp_github_api_throttle_rule_path} (GitHub API error); skipping check"
+    fi
+    return 0
+  fi
+
+  if [[ -z "$rule_text" ]]; then
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_github_api_throttle_rule_path" \
+        "$(rp_github_api_throttle_rule_content_for_apply_fix "$slug")" \
+        'add-github-api-throttle-rule' \
+        'chore: add github-api-throttle cursor rule (repository-helpers#608)'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add .cursor/rules/github-api-throttle.mdc — route agent gh calls through scripts/gh-api (repository-helpers#608; template: scripts/lib/repo-practices-cursor/)"
+    fi
+    return 0
+  fi
+
+  if ! rp_github_api_throttle_rule_is_valid "$rule_text" "$slug"; then
+    if [[ "$rp_apply_fix" -eq 1 ]]; then
+      rp_queue_candidate_file_fix "$slug" "$rp_github_api_throttle_rule_path" \
+        "$(rp_github_api_throttle_rule_content_for_apply_fix "$slug")" \
+        'sync-github-api-throttle-rule' \
+        'chore: sync github-api-throttle cursor rule (repository-helpers#608)'
+    fi
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: sync .cursor/rules/github-api-throttle.mdc to the breadcrumb template (alwaysApply; scripts/gh-api via REPOSITORY_HELPERS_DIR; canonical URL)"
+    fi
+    return 0
+  fi
+
+  rp_log_check_ok "$slug" 'github-api-throttle cursor rule' \
+    "$(rp_github_url "$slug" "/blob/main/${rp_github_api_throttle_rule_path}")"
+  return 0
 }
 
 readonly rp_repo_practices_after_config_change_path='.cursor/rules/repo-practices-after-config-change.mdc'
@@ -9042,6 +9162,9 @@ rp_check_one_repo() {
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_remote_timeouts_retries "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_github_api_throttle "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
     if ! rp_check_repo_practices_after_config_change "$slug"; then
