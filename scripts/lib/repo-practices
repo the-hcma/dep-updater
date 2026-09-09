@@ -5941,6 +5941,19 @@ rp_ruleset_has_github_merge_queue() {
   (( jq_exit_code == 0 ))
 }
 
+# rp_ruleset_requires_signatures <ruleset_json>
+# True when protect-main includes a required_signatures rule (server-side reject
+# of any push/merge carrying an unverified commit).
+rp_ruleset_requires_signatures() {
+  local -r ruleset_json="${1:-}"
+  [[ -n "$ruleset_json" ]] || return 1
+  local jq_exit_code=0
+  rp_runner_jq_file "repo-practices ruleset requires signatures" "$ruleset_json" \
+    -e '[.rules[]? | select(.type == "required_signatures")] | length > 0' >/dev/null \
+    || jq_exit_code=$?
+  (( jq_exit_code == 0 ))
+}
+
 # rp_github_mq_ruleset_org_compliant <ruleset_json>
 # Quiet probe: exit 0 when merge_queue exists with org merge_method + timeout.
 # Used by --apply-fix to decide whether to reshape (no FAIL logging).
@@ -5958,6 +5971,8 @@ rp_github_mq_ruleset_org_compliant() {
   check_timeout_minutes="$(rp_runner_jq_file "repo-practices mq compliant timeout" "$ruleset_json" \
     -r '[.rules[]? | select(.type == "merge_queue") | .parameters.check_response_timeout_minutes // empty] | first // empty')"
   [[ "$check_timeout_minutes" == "$rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES" ]] || return 1
+
+  rp_ruleset_requires_signatures "$ruleset_json" || return 1
 
   return 0
 }
@@ -6024,6 +6039,7 @@ rp_protect_main_create_payload() {
   "rules": [
     {"type": "deletion"},
     {"type": "non_fast_forward"},
+    {"type": "required_signatures"},
     {
       "type": "pull_request",
       "parameters": {
@@ -7401,6 +7417,38 @@ rp_validate_github_merge_queue_ruleset() {
   return 1
 }
 
+# rp_validate_ruleset_required_signatures <slug> <ruleset_json>
+# protect-main must include a required_signatures rule so GitHub rejects any
+# push or merge that carries an unverified commit (closes the direct-to-main
+# bootstrap hole — repository-helpers#609). Rollout ratchet mirrors the D7
+# Actions checks (repository-helpers#588): FAIL under --new-repo /
+# --strict-onboarding, SUGGEST in routine --all / --suggest. --apply-fix adds
+# the rule via rp_apply_protect_main_github_mq_shape.
+rp_validate_ruleset_required_signatures() {
+  local slug="$1"
+  local ruleset_json="$2"
+
+  if [[ -z "$ruleset_json" ]]; then
+    return 0
+  fi
+  if rp_ruleset_requires_signatures "$ruleset_json"; then
+    return 0
+  fi
+
+  if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+    rp_log_fail "${slug}: protect-main must include a required_signatures rule (reject unverified commits)"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest "${slug}: add required_signatures to protect-main via --apply-fix"
+    fi
+    return 1
+  fi
+  if [[ "$rp_suggest" -eq 1 ]]; then
+    rp_log_suggest \
+      "${slug}: add required_signatures to protect-main via --apply-fix (repository-helpers#609)"
+  fi
+  return 0
+}
+
 rp_validate_graphite_enqueue_labels() {
   local slug="$1"
   local labels_json="$2"
@@ -7873,6 +7921,9 @@ rp_apply_protect_main_github_mq_shape() {
             }
           }]
           end
+        | if any(.type == "required_signatures") then .
+          else . + [{type: "required_signatures"}]
+          end
       )
     | {
         name,
@@ -8007,6 +8058,9 @@ rp_check_protect_main_ruleset() {
     repo_fail=1
   fi
   if ! rp_validate_github_merge_queue_ruleset "$slug" "$ruleset_json"; then
+    repo_fail=1
+  fi
+  if ! rp_validate_ruleset_required_signatures "$slug" "$ruleset_json"; then
     repo_fail=1
   fi
   if ! rp_validate_graphite_bypass_json "$slug" "$ruleset_json"; then

@@ -203,7 +203,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Check | Full audit | Merge-only | What it validates |
 | --- | --- | --- | --- |
 | Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
-| `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding |
+| `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) + `required_signatures` on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding; missing `required_signatures` FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`, `--apply-fix` adds it (repository-helpers#609) |
 | Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts; no Graphite-only push restrictions (GitHub MQ profile) |
 | GitHub merge queue wiring | yes | yes | `protect-main` `merge_queue`, `ci.yml` `merge_group`, dependabot auto-merge via `gh pr merge --auto` when `dependabot.yml` exists |
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
@@ -279,10 +279,16 @@ Any repo with **GitHub merge queue** (`merge_queue` rule), **`release-please.yml
 | --- | --- |
 | `deletion` | Block branch deletion |
 | `non_fast_forward` | Block force-push |
+| `required_signatures` | Reject any push or merge carrying an unverified commit (server-side; closes the direct-to-`main` bootstrap hole — repository-helpers#609) |
 | `pull_request` with `allowed_merge_methods: ["squash"]` | Squash-only merges (Release Please + merge queue) |
 | `merge_queue` with `merge_method: SQUASH` | Native GitHub merge queue (org default); `check_response_timeout_minutes: 15` |
 
 Graphite App bypass (`actor_id` **158384**) is **not** required for the org GitHub MQ profile. Leftover Graphite Integration bypass actors may be removed via `--apply-fix`.
+
+`required_signatures` needs every human contributor to have verified commit
+signing configured (`.cursor/rules/git-commit-identity.mdc` covers setup). GitHub
+signs the merge-queue / squash commits itself, so the queue keeps working.
+`--apply-fix` adds the rule to an existing ruleset.
 
 Classic branch protection on **`main`** is also required (org standard). It complements the ruleset — reviews and CI — while **`protect-main`** enforces squash-only merges and GitHub `merge_queue`.
 
