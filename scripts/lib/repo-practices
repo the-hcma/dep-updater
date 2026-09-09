@@ -2892,14 +2892,14 @@ rp_github_api_throttle_rule_is_valid() {
     <<<"$text"
 }
 
-# repository-helpers#608 roll-out: SUGGEST-only everywhere for now — a missing or
-# stale breadcrumb never sets repo_fail, even under --strict-onboarding /
-# --new-repo, so the nightly enforcer stays green while consumers adopt. Flip to
-# FAIL under --strict-onboarding / --new-repo once org-wide adoption completes
-# (see .cursor/rules/org-cursor-rule-rollout.mdc; same ratchet endpoint as
-# #570 / #588).
+# repository-helpers#608 roll-out complete (Part A #614; Part B — all 12 org repos
+# carry the breadcrumb). Now FAILs under --strict-onboarding / --new-repo like the
+# #570 / #588 ratchet endpoints: a missing or stale rule is a hard failure for
+# onboarding / new repos. A routine --all / --suggest run (no strict flag) still
+# only SUGGESTs, so the guidance keeps landing softly on any repo that drifts.
 rp_check_github_api_throttle() {
   local slug="$1"
+  local repo_fail=0
   local rule_text fetch_ec=0 repo_dir local_path
 
   if [[ "$(rp_repo_short_name "$slug")" == "$rp_THIS_REPO_NAME" ]]; then
@@ -2917,6 +2917,10 @@ rp_check_github_api_throttle() {
       || fetch_ec=$?
   fi
   if (( fetch_ec == 2 )); then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      rp_log_gh_api_fail "$slug" "could not read ${rp_github_api_throttle_rule_path}"
+      return 1
+    fi
     if [[ "$rp_suggest" -eq 1 ]]; then
       rp_log_suggest \
         "${slug}: retry github-api-throttle rule check after GitHub API recovers"
@@ -2928,6 +2932,12 @@ rp_check_github_api_throttle() {
   fi
 
   if [[ -z "$rule_text" ]]; then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'github-api-throttle cursor rule (.cursor/rules/github-api-throttle.mdc)' \
+        "$(rp_github_url "$slug" '/new/main/.cursor/rules/github-api-throttle.mdc')"
+    fi
     if [[ "$rp_apply_fix" -eq 1 ]]; then
       rp_queue_candidate_file_fix "$slug" "$rp_github_api_throttle_rule_path" \
         "$(rp_github_api_throttle_rule_content_for_apply_fix "$slug")" \
@@ -2938,10 +2948,16 @@ rp_check_github_api_throttle() {
       rp_log_suggest \
         "${slug}: add .cursor/rules/github-api-throttle.mdc — route agent gh calls through scripts/gh-api (repository-helpers#608; template: scripts/lib/repo-practices-cursor/)"
     fi
-    return 0
+    return "$repo_fail"
   fi
 
   if ! rp_github_api_throttle_rule_is_valid "$rule_text" "$slug"; then
+    if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+      repo_fail=1
+      rp_log_check_fail "$slug" \
+        'github-api-throttle rule must be alwaysApply and route agent gh calls through scripts/gh-api via REPOSITORY_HELPERS_DIR (consumers: canonical breadcrumb URL)' \
+        "$(rp_github_url "$slug" "/blob/main/${rp_github_api_throttle_rule_path}")"
+    fi
     if [[ "$rp_apply_fix" -eq 1 ]]; then
       rp_queue_candidate_file_fix "$slug" "$rp_github_api_throttle_rule_path" \
         "$(rp_github_api_throttle_rule_content_for_apply_fix "$slug")" \
@@ -2952,7 +2968,7 @@ rp_check_github_api_throttle() {
       rp_log_suggest \
         "${slug}: sync .cursor/rules/github-api-throttle.mdc to the breadcrumb template (alwaysApply; scripts/gh-api via REPOSITORY_HELPERS_DIR; canonical URL)"
     fi
-    return 0
+    return "$repo_fail"
   fi
 
   rp_log_check_ok "$slug" 'github-api-throttle cursor rule' \

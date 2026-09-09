@@ -4133,7 +4133,7 @@ promote_out="$(
 
     rc() { local e=0; "$@" >/dev/null 2>&1 || e=$?; printf "%s" "$e"; }
     fails=""
-    for fn in rp_check_no_secret_exposure rp_check_pre_pr_checks_rule rp_check_agent_bootstrap rp_check_remote_timeouts_retries; do
+    for fn in rp_check_no_secret_exposure rp_check_pre_pr_checks_rule rp_check_agent_bootstrap rp_check_remote_timeouts_retries rp_check_github_api_throttle; do
       rp_strict_onboarding=0; rp_new_repo=0
       [[ "$(rc "$fn" the-hcma/example-repo)" == 0 ]] || fails="$fails ${fn}:routine-should-pass"
       rp_strict_onboarding=1; rp_new_repo=0
@@ -4146,7 +4146,7 @@ promote_out="$(
 rm -rf "$promote_dir"
 unset RUNNER_SESSION_ROOT
 if [[ "$promote_out" == 'ok' ]]; then
-  printf '[PASS] #575: no-secret-exposure / pre-pr-checks / agent-bootstrap / remote-timeouts missing files FAIL --strict-onboarding, not routine --all\n'
+  printf '[PASS] #575: no-secret-exposure / pre-pr-checks / agent-bootstrap / remote-timeouts / github-api-throttle missing files FAIL --strict-onboarding, not routine --all\n'
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] #575: strict-onboarding promotion of missing rollout files (%s)\n' "$promote_out"
@@ -5316,31 +5316,48 @@ else
   fail=$(( fail + 1 ))
 fi
 
-printf '\n=== unit: github-api-throttle missing rule SUGGESTs, never FAILs (roll-out) ===\n'
+printf '\n=== unit: github-api-throttle rule — routine SUGGESTs, strict/new-repo FAILs (repository-helpers#608 rollout complete) ===\n'
 gat_suggest="$(
   bash -c '
     set -euo pipefail
     # shellcheck disable=SC1091
     source "$1"
-    rp_suggest=1
     rp_apply_fix=0
-    rp_strict_onboarding=1
-    rp_new_repo=1
-    rp_fetch_github_text_file() { return 1; }
     rp_repo_short_name() { printf "some-consumer\n"; }
-    rc=0
-    out="$(rp_check_github_api_throttle "the-hcma/some-consumer" 2>&1)" || rc=$?
-    printf "rc=%s\n" "$rc"
-    printf "%s\n" "$out"
+    rp_log_check_fail() { printf "CHECK_FAIL:%s\n" "$2" >&2; }
+    rp_log_check_ok() { :; }
+    rp_log_suggest() { printf "SUGGEST:%s\n" "$1" >&2; }
+    rp_log_warn() { :; }
+    rp_github_url() { printf "u\n"; }
+    invalid="$(printf -- "---\nalwaysApply: true\n---\nno wrapper mention here\n")"
+
+    run() { local e=0; rp_check_github_api_throttle "the-hcma/some-consumer" 2>&1 || e=$?; printf "rc=%s\n" "$e"; }
+
+    printf -- "--- routine (no strict), missing ---\n"
+    rp_suggest=1; rp_strict_onboarding=0; rp_new_repo=0
+    rp_fetch_github_text_file() { return 1; }
+    run
+    printf -- "--- strict, missing ---\n"
+    rp_strict_onboarding=1; rp_new_repo=0
+    run
+    printf -- "--- new-repo, missing ---\n"
+    rp_strict_onboarding=0; rp_new_repo=1
+    run
+    printf -- "--- strict, invalid rule ---\n"
+    rp_strict_onboarding=1; rp_new_repo=0
+    eval "rp_fetch_github_text_file() { printf %s \"\$invalid\"; }"
+    run
   ' bash "$lib"
 )"
-if grep -qF 'rc=0' <<<"$gat_suggest" \
-  && grep -qF 'add .cursor/rules/github-api-throttle.mdc' <<<"$gat_suggest" \
-  && grep -qF 'repository-helpers#608' <<<"$gat_suggest"; then
-  printf '[PASS] github-api-throttle: missing rule under --strict-onboarding/--new-repo is SUGGEST-only (exit 0)\n'
+if [[ "$(grep -c 'rc=0' <<<"$gat_suggest")" == 1 ]] \
+  && [[ "$(grep -c 'rc=1' <<<"$gat_suggest")" == 3 ]] \
+  && grep -qF 'SUGGEST:the-hcma/some-consumer: add .cursor/rules/github-api-throttle.mdc' <<<"$gat_suggest" \
+  && grep -qF 'CHECK_FAIL:github-api-throttle cursor rule (.cursor/rules/github-api-throttle.mdc)' <<<"$gat_suggest" \
+  && grep -qF 'CHECK_FAIL:github-api-throttle rule must be alwaysApply' <<<"$gat_suggest"; then
+  printf '[PASS] github-api-throttle: routine --suggest is SUGGEST-only (rc 0); --strict-onboarding / --new-repo FAIL on missing AND invalid rule (rc 1)\n'
   pass=$(( pass + 1 ))
 else
-  printf '[FAIL] github-api-throttle: missing rule should SUGGEST and return 0\n%s\n' "$gat_suggest"
+  printf '[FAIL] github-api-throttle: rollout-complete ratchet wrong\n%s\n' "$gat_suggest"
   fail=$(( fail + 1 ))
 fi
 
