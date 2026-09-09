@@ -105,6 +105,9 @@ if grep -qF 'rp_log_manual_step' "$lib" \
   && grep -qF 'rp_ruleset_requires_signatures' "$lib" \
   && grep -qF 'rp_validate_ruleset_required_signatures' "$lib" \
   && grep -qF 'required_signatures' "$lib" \
+  && grep -qF 'rp_ruleset_requires_code_owner_review' "$lib" \
+  && grep -qF 'rp_ruleset_has_org_admin_bypass' "$lib" \
+  && grep -qF 'rp_validate_ruleset_code_owner_review' "$lib" \
   && grep -qF 'rp_check_main_commit_verification' "$lib" \
   && grep -qF 'cleanup-merged-branches.yml' "$lib" \
   && grep -qF 'rp_cleanup_merged_branches_workflow_is_canonical' "$lib" \
@@ -1842,6 +1845,149 @@ if [[ "$(grep -c 'rc=0' <<<"$rs_val")" == 4 ]] \
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] rp_validate_ruleset_required_signatures ratchet wrong\n%s\n' "$rs_val"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: protect-main require_code_owner_review — probe + create payload + org-admin bypass (repository-helpers#626) ===\n'
+cor_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    with='"'"'{"rules":[{"type":"pull_request","parameters":{"require_code_owner_review":true}}],"bypass_actors":[{"actor_id":1,"actor_type":"OrganizationAdmin","bypass_mode":"pull_request"}]}'"'"'
+    # GitHub normalises the org-admin actor_id to null on ruleset GET.
+    with_null_id='"'"'{"rules":[{"type":"pull_request","parameters":{"require_code_owner_review":true}}],"bypass_actors":[{"actor_id":null,"actor_type":"OrganizationAdmin","bypass_mode":"pull_request"}]}'"'"'
+    # bypass_mode "always" also bypasses required_signatures on a direct push (#609) -> not a valid bypass.
+    with_always='"'"'{"rules":[{"type":"pull_request","parameters":{"require_code_owner_review":true}}],"bypass_actors":[{"actor_id":null,"actor_type":"OrganizationAdmin","bypass_mode":"always"}]}'"'"'
+    without='"'"'{"rules":[{"type":"pull_request","parameters":{"require_code_owner_review":false}}],"bypass_actors":[]}'"'"'
+    rp_ruleset_requires_code_owner_review "$with" && printf "cor_with=0\n" || printf "cor_with=1\n"
+    rp_ruleset_requires_code_owner_review "$without" && printf "cor_without=0\n" || printf "cor_without=1\n"
+    rp_ruleset_has_org_admin_bypass "$with" && printf "bypass_with=0\n" || printf "bypass_with=1\n"
+    rp_ruleset_has_org_admin_bypass "$with_null_id" && printf "bypass_null_id=0\n" || printf "bypass_null_id=1\n"
+    rp_ruleset_has_org_admin_bypass "$with_always" && printf "bypass_always=0\n" || printf "bypass_always=1\n"
+    rp_ruleset_has_org_admin_bypass "$without" && printf "bypass_without=0\n" || printf "bypass_without=1\n"
+    p="$(rp_protect_main_create_payload)"
+    printf %s "$p" | /usr/bin/jq -e "([.rules[]|select(.type==\"pull_request\")|.parameters.require_code_owner_review]|first)==true" >/dev/null \
+      && printf "payload_rule=yes\n" || printf "payload_rule=no\n"
+    printf %s "$p" | /usr/bin/jq -e "[.bypass_actors[]|select(.actor_type==\"OrganizationAdmin\" and .actor_id==1 and .bypass_mode==\"pull_request\")]|length==1" >/dev/null \
+      && printf "payload_bypass=yes\n" || printf "payload_bypass=no\n"
+    rp_github_mq_ruleset_org_compliant "$p" && printf "compliant_fresh=0\n" || printf "compliant_fresh=1\n"
+    rp_github_mq_ruleset_org_compliant "'"'"'{"rules":[{"type":"merge_queue","parameters":{"merge_method":"SQUASH","check_response_timeout_minutes":15}},{"type":"required_signatures"},{"type":"pull_request","parameters":{"require_code_owner_review":false}}],"bypass_actors":[]}'"'"'" \
+      && printf "compliant_norule=0\n" || printf "compliant_norule=1\n"
+  ' bash "$lib"
+)"
+if grep -qxF 'cor_with=0' <<<"$cor_out" \
+  && grep -qxF 'cor_without=1' <<<"$cor_out" \
+  && grep -qxF 'bypass_with=0' <<<"$cor_out" \
+  && grep -qxF 'bypass_null_id=0' <<<"$cor_out" \
+  && grep -qxF 'bypass_always=1' <<<"$cor_out" \
+  && grep -qxF 'bypass_without=1' <<<"$cor_out" \
+  && grep -qxF 'payload_rule=yes' <<<"$cor_out" \
+  && grep -qxF 'payload_bypass=yes' <<<"$cor_out" \
+  && grep -qxF 'compliant_fresh=0' <<<"$cor_out" \
+  && grep -qxF 'compliant_norule=1' <<<"$cor_out"; then
+  printf '[PASS] require_code_owner_review: probes distinguish; create payload carries rule + OrganizationAdmin bypass; compliance requires both\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] require_code_owner_review probe/payload/compliance wrong\n%s\n' "$cor_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_validate_ruleset_code_owner_review — ratchet + always-FAIL on rule-without-bypass (repository-helpers#626) ===\n'
+cor_val="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    rp_log_fail() { printf "FAIL:%s\n" "$1" >&2; }
+    rp_log_suggest() { printf "SUGGEST:%s\n" "$1" >&2; }
+    without='"'"'{"rules":[{"type":"pull_request","parameters":{"require_code_owner_review":false}}],"bypass_actors":[]}'"'"'
+    rule_no_bypass='"'"'{"rules":[{"type":"pull_request","parameters":{"require_code_owner_review":true}}],"bypass_actors":[]}'"'"'
+    rule_always_bypass='"'"'{"rules":[{"type":"pull_request","parameters":{"require_code_owner_review":true}}],"bypass_actors":[{"actor_id":null,"actor_type":"OrganizationAdmin","bypass_mode":"always"}]}'"'"'
+    full='"'"'{"rules":[{"type":"pull_request","parameters":{"require_code_owner_review":true}}],"bypass_actors":[{"actor_id":null,"actor_type":"OrganizationAdmin","bypass_mode":"pull_request"}]}'"'"'
+    run() { local e=0; rp_validate_ruleset_code_owner_review "the-hcma/x" "$1" 2>&1 || e=$?; printf "rc=%s\n" "$e"; }
+
+    printf -- "--- routine, rule absent, no --suggest ---\n"
+    rp_suggest=0; rp_strict_onboarding=0; rp_new_repo=0
+    run "$without"
+    printf -- "--- routine --suggest, rule absent ---\n"
+    rp_suggest=1
+    run "$without"
+    printf -- "--- strict, rule absent ---\n"
+    rp_suggest=0; rp_strict_onboarding=1; rp_new_repo=0
+    run "$without"
+    printf -- "--- new-repo, rule absent ---\n"
+    rp_strict_onboarding=0; rp_new_repo=1
+    run "$without"
+    printf -- "--- routine (no strict), rule present but no bypass ---\n"
+    rp_suggest=0; rp_strict_onboarding=0; rp_new_repo=0
+    run "$rule_no_bypass"
+    printf -- "--- routine (no strict), rule present but bypass_mode always ---\n"
+    run "$rule_always_bypass"
+    printf -- "--- strict, rule + pull_request bypass present ---\n"
+    rp_strict_onboarding=1
+    run "$full"
+    printf -- "--- empty ruleset json ---\n"
+    run ""
+  ' bash "$lib"
+)"
+if [[ "$(grep -c "rc=0" <<<"$cor_val")" == 4 ]] \
+  && [[ "$(grep -c "rc=1" <<<"$cor_val")" == 4 ]] \
+  && [[ "$(grep -c "SUGGEST:" <<<"$cor_val")" == 1 ]] \
+  && [[ "$(grep -c "FAIL:the-hcma/x: protect-main requires CODEOWNER review with no OrganizationAdmin bypass" <<<"$cor_val")" == 2 ]] \
+  && [[ "$(grep -c "FAIL:the-hcma/x: protect-main pull_request rule must set require_code_owner_review" <<<"$cor_val")" == 2 ]]; then
+  printf '[PASS] rp_validate_ruleset_code_owner_review: routine SUGGEST-only; strict / new-repo FAIL; rule without pull_request bypass FAILs always; full + empty pass\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_validate_ruleset_code_owner_review ratchet wrong\n%s\n' "$cor_val"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_apply_protect_main_github_mq_shape — adds require_code_owner_review + OrganizationAdmin bypass, idempotent (repository-helpers#626) ===\n'
+cor_patch="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    rp_log_warn() { :; }
+    # Seed a stale Graphite Integration bypass AND an "always"-mode OrganizationAdmin
+    # bypass — the patcher must strip the first and rewrite the second to pull_request.
+    existing='"'"'{"name":"protect-main","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["refs/heads/main"],"exclude":[]}},"bypass_actors":[{"actor_id":158384,"actor_type":"Integration","bypass_mode":"always"},{"actor_id":null,"actor_type":"OrganizationAdmin","bypass_mode":"always"}],"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"pull_request","parameters":{"allowed_merge_methods":["squash"],"require_code_owner_review":false}},{"type":"merge_queue","parameters":{"merge_method":"SQUASH","check_response_timeout_minutes":15}}]}'"'"'
+    cur="$existing"
+    rp_runner_gh_api_stream() {
+      case "$1" in
+        *"ruleset id"*) printf "12345" ;;
+        *) printf %s "$cur" ;;
+      esac
+    }
+    rp_runner_gh_api_input() {
+      # args: label payload -X PUT path
+      cur="$2"
+    }
+    rp_fetch_protect_main_ruleset() { printf %s "$cur"; }
+
+    rp_apply_protect_main_github_mq_shape "the-hcma/x"
+    printf %s "$cur" | /usr/bin/jq -e "([.rules[]|select(.type==\"pull_request\")|.parameters.require_code_owner_review]|first)==true" >/dev/null && printf "rule=yes\n" || printf "rule=no\n"
+    printf %s "$cur" | /usr/bin/jq -e "[.bypass_actors[]|select(.actor_type==\"OrganizationAdmin\" and .bypass_mode==\"pull_request\")]|length==1" >/dev/null && printf "admin=yes\n" || printf "admin=no\n"
+    printf %s "$cur" | /usr/bin/jq -e "[.bypass_actors[]|select(.actor_type==\"OrganizationAdmin\" and .bypass_mode==\"always\")]|length==0" >/dev/null && printf "no_always=yes\n" || printf "no_always=no\n"
+    printf %s "$cur" | /usr/bin/jq -e "[.bypass_actors[]|select(.actor_type==\"Integration\")]|length==0" >/dev/null && printf "no_integration=yes\n" || printf "no_integration=no\n"
+    printf %s "$cur" | /usr/bin/jq -e "[.bypass_actors[]|select(.actor_id==158384)]|length==0" >/dev/null && printf "graphite_gone=yes\n" || printf "graphite_gone=no\n"
+
+    # second pass must not duplicate actors
+    rp_apply_protect_main_github_mq_shape "the-hcma/x"
+    printf %s "$cur" | /usr/bin/jq -e ".bypass_actors|length==1" >/dev/null && printf "idempotent=yes\n" || printf "idempotent=no\n"
+  ' bash "$lib"
+)"
+if grep -qxF 'rule=yes' <<<"$cor_patch" \
+  && grep -qxF 'admin=yes' <<<"$cor_patch" \
+  && grep -qxF 'no_always=yes' <<<"$cor_patch" \
+  && grep -qxF 'no_integration=yes' <<<"$cor_patch" \
+  && grep -qxF 'graphite_gone=yes' <<<"$cor_patch" \
+  && grep -qxF 'idempotent=yes' <<<"$cor_patch"; then
+  printf '[PASS] rp_apply_protect_main_github_mq_shape: adds rule, rewrites always->pull_request, strips Graphite, idempotent\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_apply_protect_main_github_mq_shape code-owner-review patch wrong\n%s\n' "$cor_patch"
   fail=$(( fail + 1 ))
 fi
 
