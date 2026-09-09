@@ -8158,6 +8158,106 @@ rp_check_classic_main_protection() {
   return "$repo_fail"
 }
 
+# rp_main_commit_verification_api_error <slug> <detail>
+# GitHub API failure while reading the default-branch HEAD verification. Fatal
+# (caller returns 1) under --new-repo / --strict-onboarding; otherwise a retry
+# SUGGEST and non-fatal. Mirrors rp_agent_bootstrap_api_error_is_fatal so a
+# transient API error on the two extra endpoints does not turn every --suggest
+# audit into a hard failure. Returns 0 when the caller should fail.
+rp_main_commit_verification_api_error() {
+  local -r slug="$1"
+  local -r detail="$2"
+
+  if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+    rp_log_gh_api_fail "$slug" "$detail"
+    rp_log_check_fail "$slug" 'main HEAD commit verification (GitHub API error; retry)' \
+      "$(rp_github_url "$slug" '/commits/main')"
+    return 0
+  fi
+  if [[ "$rp_suggest" -eq 1 ]]; then
+    rp_log_suggest "${slug}: retry main HEAD commit verification after GitHub API recovers"
+  fi
+  return 1
+}
+
+# rp_check_main_commit_verification <slug>
+# Audit the actual verification status of the default branch HEAD — independent
+# of the protect-main required_signatures rule, so it also catches repos
+# onboarded before that rule and drift the ruleset cannot retroactively fix
+# (repository-helpers#609). Rollout ratchet mirrors the D7 Actions checks
+# (repository-helpers#588) and the sibling required_signatures check: FAIL under
+# --new-repo / --strict-onboarding (so the nightly `--enforcer` surfaces an
+# unverified HEAD under Failed:), SUGGEST in routine --all / --suggest. A
+# GitHub API error on the extra call is fatal only under strict/new-repo (a
+# retry SUGGEST otherwise — rp_main_commit_verification_api_error). Bot authors
+# are skipped. No --apply-fix path (history is immutable — re-sign and re-push).
+rp_check_main_commit_verification() {
+  local slug="$1"
+  local repo_fail=0
+  local commit_tsv sha verified reason author_login
+  local fetch_exit=0
+
+  # Nothing to surface in a plain routine audit (no FAIL, no SUGGEST) — skip the
+  # extra API call per repo. Runs under --new-repo / --strict-onboarding /
+  # --suggest (--compact implies --suggest, so the enforcer runs it).
+  if [[ "$rp_new_repo" -ne 1 && "$rp_strict_onboarding" -ne 1 && "$rp_suggest" -ne 1 ]]; then
+    return 0
+  fi
+
+  # GET /repos/{slug}/commits (no sha) lists the default branch newest-first, so
+  # .[0] is the default-branch HEAD — one call, no separate default_branch fetch.
+  commit_tsv="$(rp_runner_gh_api_stream "repo-practices main head verification" \
+    "repos/${slug}/commits" --jq \
+    '.[0] | [.sha, (.commit.verification.verified | tostring), (.commit.verification.reason // ""), (.author.login // "")] | @tsv')" \
+    || fetch_exit=$?
+  if (( fetch_exit != 0 )) || [[ -z "$commit_tsv" ]]; then
+    if rp_main_commit_verification_api_error "$slug" 'could not read main HEAD commit verification'; then
+      return 1
+    fi
+    return 0
+  fi
+
+  IFS=$'\t' read -r sha verified reason author_login <<<"$commit_tsv"
+
+  # Bot commits (dependabot, GitHub web-flow merges, github-actions) sit outside
+  # the human-contributor signing policy — GitHub verifies its own where it can.
+  if [[ "$author_login" == *'[bot]' || "$author_login" == 'web-flow' \
+    || "$author_login" == "$rp_DEPENDABOT_APP_SLUG" ]]; then
+    rp_log_check_ok "$slug" "main HEAD commit verification (skipped: bot author ${author_login})" \
+      "$(rp_github_url "$slug" "/commit/${sha}")"
+    return 0
+  fi
+
+  if [[ "$verified" == 'true' ]]; then
+    rp_log_check_ok "$slug" 'main HEAD commit verification' \
+      "$(rp_github_url "$slug" "/commit/${sha}")"
+    return 0
+  fi
+
+  if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+    rp_log_fail "${slug}: main HEAD ${sha} is not a verified commit (reason: ${reason:-unknown})"
+    repo_fail=1
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: re-sign main HEAD ${sha} and re-push (git-commit-identity.mdc); GitHub requires a UID on the signing key matching the commit author"
+    fi
+  elif [[ "$rp_suggest" -eq 1 ]]; then
+    rp_log_suggest \
+      "${slug}: main HEAD ${sha} is unverified (reason: ${reason:-unknown}) — re-sign and re-push (repository-helpers#609)"
+  fi
+
+  if [[ "$repo_fail" -eq 0 ]]; then
+    rp_log_check_ok "$slug" \
+      "main HEAD commit verification (unverified: ${reason:-unknown})" \
+      "$(rp_github_url "$slug" "/commit/${sha}")"
+  else
+    rp_log_check_fail "$slug" \
+      'main HEAD commit verification (sign commits — see .cursor/rules/git-commit-identity.mdc)' \
+      "$(rp_github_url "$slug" "/commit/${sha}")"
+  fi
+  return "$repo_fail"
+}
+
 rp_check_github_merge_queue() {
   local slug="$1"
   local repo_fail=0
@@ -9188,6 +9288,9 @@ rp_check_one_repo() {
   fi
   if [[ "$rp_merge_only" -eq 0 ]]; then
     if ! rp_check_classic_main_protection "$slug"; then
+      total_fail=$(( total_fail + 1 ))
+    fi
+    if ! rp_check_main_commit_verification "$slug"; then
       total_fail=$(( total_fail + 1 ))
     fi
   fi

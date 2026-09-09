@@ -105,6 +105,7 @@ if grep -qF 'rp_log_manual_step' "$lib" \
   && grep -qF 'rp_ruleset_requires_signatures' "$lib" \
   && grep -qF 'rp_validate_ruleset_required_signatures' "$lib" \
   && grep -qF 'required_signatures' "$lib" \
+  && grep -qF 'rp_check_main_commit_verification' "$lib" \
   && grep -qF 'cleanup-merged-branches.yml' "$lib" \
   && grep -qF 'rp_cleanup_merged_branches_workflow_is_canonical' "$lib" \
   && grep -qF 'rp_gh_path_check' "$lib" \
@@ -1086,6 +1087,10 @@ if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
   exit 0
 fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
 if [[ "$args" == *'/contents/'* ]]; then
   exit 1
 fi
@@ -1169,6 +1174,10 @@ if [[ "$args" == *'pr-ship-and-review.mdc'* ]]; then
 fi
 if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
+  exit 0
+fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
   exit 0
 fi
 if [[ "$args" == *'/contents/'* ]]; then
@@ -1255,6 +1264,10 @@ if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
   exit 0
 fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
 if [[ "$args" == *'/contents/'* ]]; then
   exit 1
 fi
@@ -1337,6 +1350,10 @@ if [[ "$args" == *'pr-ship-and-review.mdc'* ]]; then
 fi
 if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
+  exit 0
+fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
   exit 0
 fi
 if [[ "$args" == *'/contents/'* ]]; then
@@ -1495,6 +1512,10 @@ if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
   exit 0
 fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
 if [[ "$args" == *'/contents/'* ]]; then
   exit 1
 fi
@@ -1565,6 +1586,10 @@ if [[ "$args" == *'pr-ship-and-review.mdc'* ]]; then
 fi
 if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
+  exit 0
+fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
   exit 0
 fi
 if [[ "$args" == *'/contents/'* ]]; then
@@ -1651,6 +1676,10 @@ if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
   exit 0
 fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
 if [[ "$args" == *'/contents/'* ]]; then
   exit 1
 fi
@@ -1705,6 +1734,10 @@ if [[ "$args" == *'repos/the-hcma/flaky-service/rulesets'* ]]; then
 fi
 if [[ "$args" == *'/labels'* ]]; then
   printf '%s\n' '[]'
+  exit 0
+fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
   exit 0
 fi
 if [[ "$args" == *'contents/'* ]]; then
@@ -1809,6 +1842,71 @@ if [[ "$(grep -c 'rc=0' <<<"$rs_val")" == 4 ]] \
   pass=$(( pass + 1 ))
 else
   printf '[FAIL] rp_validate_ruleset_required_signatures ratchet wrong\n%s\n' "$rs_val"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_check_main_commit_verification — verified / bot / API error / rollout ratchet (repository-helpers#609) ===\n'
+mcv_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    rp_log_fail() { printf "FAIL:%s\n" "$1" >&2; }
+    rp_log_suggest() { printf "SUGGEST:%s\n" "$1" >&2; }
+    rp_log_check_ok() { printf "OK:%s\n" "$2" >&2; }
+    rp_log_check_fail() { printf "CHECK_FAIL:%s\n" "$2" >&2; }
+    rp_log_gh_api_fail() { printf "GH_API_FAIL:%s\n" "$2" >&2; }
+    rp_github_url() { printf "u\n"; }
+    rp_apply_fix=0
+
+    # One call: repos/{slug}/commits. MCV_FAIL forces it to error; MCV_TSV is the
+    # parsed .[0] row (sha, verified, reason, author_login).
+    mk() {
+      eval "rp_runner_gh_api_stream() {
+        [[ -n \"\$MCV_FAIL\" ]] && return 1
+        printf %s \"\$MCV_TSV\"
+      }"
+    }
+    mk
+    run() { local e=0; rp_check_main_commit_verification "the-hcma/x" 2>&1 || e=$?; printf "rc=%s\n" "$e"; }
+
+    printf -- "--- verified (--suggest) ---\n"
+    MCV_FAIL=""; MCV_TSV=$(printf "abc123\ttrue\t\tsomeone"); rp_suggest=1; rp_strict_onboarding=0; rp_new_repo=0
+    run
+    printf -- "--- plain routine (all flags off) is skipped silently ---\n"
+    MCV_TSV=$(printf "abc123\tfalse\tbad_email\tsomeone"); rp_suggest=0
+    run
+    printf -- "--- unverified, --suggest only (routine) -> SUGGEST, rc 0 ---\n"
+    rp_suggest=1
+    run
+    printf -- "--- unverified, --strict-onboarding -> FAIL ---\n"
+    rp_suggest=0; rp_strict_onboarding=1
+    run
+    printf -- "--- unverified, --new-repo -> FAIL ---\n"
+    rp_strict_onboarding=0; rp_new_repo=1
+    run
+    printf -- "--- unverified bot author, --new-repo -> skipped OK ---\n"
+    MCV_TSV=$(printf "abc123\tfalse\tunsigned\tdependabot[bot]")
+    run
+    printf -- "--- gh api failure, --new-repo -> fatal ---\n"
+    MCV_FAIL=1; MCV_TSV=""
+    run
+    printf -- "--- gh api failure, --suggest only -> retry SUGGEST, rc 0 ---\n"
+    rp_new_repo=0; rp_suggest=1
+    run
+  ' bash "$lib"
+)"
+if [[ "$(grep -c 'rc=0' <<<"$mcv_out")" == 5 ]] \
+  && [[ "$(grep -c 'rc=1' <<<"$mcv_out")" == 3 ]] \
+  && [[ "$(grep -c 'SUGGEST:' <<<"$mcv_out")" == 2 ]] \
+  && [[ "$(grep -c 'FAIL:the-hcma/x: main HEAD abc123 is not a verified commit' <<<"$mcv_out")" == 2 ]] \
+  && grep -qF 'OK:main HEAD commit verification (skipped: bot author dependabot[bot])' <<<"$mcv_out" \
+  && grep -qF 'SUGGEST:the-hcma/x: retry main HEAD commit verification after GitHub API recovers' <<<"$mcv_out" \
+  && grep -qF 'GH_API_FAIL:could not read main HEAD commit verification' <<<"$mcv_out"; then
+  printf '[PASS] rp_check_main_commit_verification: verified/bot handled; strict/new-repo FAIL; routine --suggest SUGGEST-only; API error fatal only under strict/new-repo; plain routine skipped\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_check_main_commit_verification ratchet wrong\n%s\n' "$mcv_out"
   fail=$(( fail + 1 ))
 fi
 
@@ -2008,6 +2106,14 @@ if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
   exit 0
 fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"abc1234","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"henrique"}}]'
+  exit 0
+fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
 if [[ "$args" == *'/contents/'* ]]; then
   exit 1
 fi
@@ -2134,6 +2240,10 @@ if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
   exit 0
 fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
 if [[ "$args" == *'/contents/'* ]]; then
   exit 1
 fi
@@ -2210,6 +2320,10 @@ if [[ "$args" == *'pr-ship-and-review.mdc'* ]]; then
 fi
 if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
+  exit 0
+fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
   exit 0
 fi
 if [[ "$args" == *'/contents/'* ]]; then
@@ -3021,6 +3135,10 @@ if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
   exit 0
 fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
 if [[ "$args" == *'/contents/'* ]]; then
   exit 1
 fi
@@ -3114,6 +3232,10 @@ if [[ "$args" == *'repo-practices-after-config-change.mdc'* ]]; then
 fi
 if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
+  exit 0
+fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
   exit 0
 fi
 if [[ "$args" == *'/contents/'* ]]; then
@@ -3670,6 +3792,10 @@ if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
   exit 0
 fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
 if [[ "$args" == *'/contents/'* ]]; then
   exit 1
 fi
@@ -3759,6 +3885,10 @@ if [[ "$args" == *'git-commit-identity.mdc'* ]]; then
 fi
 if [[ "$args" == *'pre-pr-checks.mdc'* ]]; then
   printf '%s\n' "{\"content\":\"${GRL_PRE_PR_CHECKS_B64}\"}"
+  exit 0
+fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
   exit 0
 fi
 if [[ "$args" == *'/contents/'* ]]; then
@@ -5939,6 +6069,10 @@ if [[ "$args" == *'cleanup-merged-branches.yml'* ]]; then
   echo 'gh: HTTP 502' >&2
   exit 1
 fi
+if [[ "$args" == *'/commits --jq'* ]]; then
+  printf '%s\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
+fi
 if [[ "$args" == *'/contents/'* ]]; then
   echo 'gh: Not Found (HTTP 404)' >&2
   exit 1
@@ -6019,6 +6153,10 @@ fi
 if [[ "\$args" == *'cleanup-branch-on-merge.yml'* ]]; then
   echo 'gh: Not Found (HTTP 404)' >&2
   exit 1
+fi
+if [[ "\$args" == *'/commits --jq'* ]]; then
+  printf '%s\\n' '[{"sha":"d1f4abc","commit":{"verification":{"verified":true,"reason":"valid"}},"author":{"login":"tester"}}]'
+  exit 0
 fi
 if [[ "\$args" == *'/contents/'* ]]; then
   echo 'gh: Not Found (HTTP 404)' >&2

@@ -387,6 +387,7 @@ also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 | Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
 | `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) + `required_signatures` on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding |
 | `protect-main` `required_signatures` | yes* | yes | Ruleset rejects any push/merge with an unverified commit (*missing FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`; `--apply-fix` adds the rule — repository-helpers#609) |
+| Main HEAD commit verification | yes* | — | Default-branch HEAD reports `commit.verification.verified` (bot authors skipped) (*missing verification FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`; no `--apply-fix` — repository-helpers#609) |
 | Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts; no Graphite-only push restrictions (GitHub MQ profile) |
 | GitHub merge queue wiring | yes | yes | `protect-main` `merge_queue`, `ci.yml` `merge_group`, dependabot auto-merge via `gh pr merge --auto` when `dependabot.yml` exists |
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |

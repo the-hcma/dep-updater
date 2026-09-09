@@ -205,6 +205,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
 | `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) + `required_signatures` on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding; missing `required_signatures` FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`, `--apply-fix` adds it (repository-helpers#609) |
 | Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts; no Graphite-only push restrictions (GitHub MQ profile) |
+| Main HEAD commit verification | yes* | — | Default-branch HEAD reports `commit.verification.verified` (bot authors skipped) (*missing verification FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`; no `--apply-fix` — re-sign and re-push — repository-helpers#609) |
 | GitHub merge queue wiring | yes | yes | `protect-main` `merge_queue`, `ci.yml` `merge_group`, dependabot auto-merge via `gh pr merge --auto` when `dependabot.yml` exists |
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
 | Branch cleanup workflows | yes | — | `cleanup-branch-on-merge.yml`, `cleanup-merged-branches.yml`, canonical `merged-pr-closer.yml` |
