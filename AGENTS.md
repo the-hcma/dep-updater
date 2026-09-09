@@ -203,7 +203,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Check | Full audit | Merge-only | What it validates |
 | --- | --- | --- | --- |
 | Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
-| `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) + `required_signatures` on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding; missing `required_signatures` FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`, `--apply-fix` adds it (repository-helpers#609) |
+| `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) + `required_signatures` + `pull_request` `require_code_owner_review` (with an `OrganizationAdmin` bypass) on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding; missing `required_signatures` / `require_code_owner_review` FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`, `--apply-fix` adds them; `require_code_owner_review` present without the `OrganizationAdmin` bypass FAILS always (repository-helpers#609, #626) |
 | Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts; no Graphite-only push restrictions (GitHub MQ profile) |
 | Main HEAD commit verification | yes* | — | Default-branch HEAD reports `commit.verification.verified` (bot authors skipped) (*missing verification FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`; no `--apply-fix` — re-sign and re-push — repository-helpers#609) |
 | GitHub merge queue wiring | yes | yes | `protect-main` `merge_queue`, `ci.yml` `merge_group`, dependabot auto-merge via `gh pr merge --auto` when `dependabot.yml` exists |
@@ -236,7 +236,7 @@ Operator-oriented copy of this table also lives in [README.md](README.md#github-
 | Actions hardening | yes* | — | `default_workflow_permissions: read` and `can_approve_pull_request_reviews: false` (`--apply-fix` sets both); `allowed_actions` and `sha_pinning_required` are SUGGEST-only always (no safe default to auto-apply) (*`default_workflow_permissions` / `can_approve_pull_request_reviews` FAIL under `--new-repo` and `--strict-onboarding`; SUGGEST in routine `--all` / `--suggest` — org-wide rollout complete, repository-helpers#588) |
 | Actions workflow `uses:` pinning | yes* | — | Third-party `uses:` refs pinned to a full commit SHA; a release/publish workflow (holds OIDC / write tokens) with a non-SHA pin is promoted past a generic suggestion (*generic non-SHA pins are SUGGEST always; release/publish workflow pins FAIL under `--new-repo` and `--strict-onboarding` — org-wide rollout complete, repository-helpers#588) |
 | Deployment environment protection | yes* | — | Any environment a workflow deploys to must have a protection rule (required reviewer) or a `deployment_branch_policy` (*missing FAILS `--new-repo` and `--strict-onboarding`; SUGGESTs in routine `--all` / `--suggest` — org-wide rollout complete, repository-helpers#588) |
-| Protection-mechanism consistency | yes | — | Advisory only: flags a genuine disagreement between classic `main` protection and the `protect-main` ruleset (e.g. `require_code_owner_reviews`) — this org runs both by design, so their coexistence is never itself flagged (repository-helpers#588) |
+| Protection-mechanism consistency | yes | — | Advisory only: flags a genuine disagreement between classic `main` protection and the `protect-main` ruleset — this org runs both by design, so their coexistence is never itself flagged. `require_code_owner_reviews` is now enforced on both sides (repository-helpers#626), so this check is normally quiet (repository-helpers#588) |
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate workflow/cursor-rule PRs via the stacking backend selected by `.github/stacking-tool` (`graphite` or `gh-stack`; org default `graphite` when the marker is missing) in the target repo clone.
 
@@ -281,15 +281,20 @@ Any repo with **GitHub merge queue** (`merge_queue` rule), **`release-please.yml
 | `deletion` | Block branch deletion |
 | `non_fast_forward` | Block force-push |
 | `required_signatures` | Reject any push or merge carrying an unverified commit (server-side; closes the direct-to-`main` bootstrap hole — repository-helpers#609) |
-| `pull_request` with `allowed_merge_methods: ["squash"]` | Squash-only merges (Release Please + merge queue) |
+| `pull_request` with `allowed_merge_methods: ["squash"]` and `require_code_owner_review: true` | Squash-only merges (Release Please + merge queue); CODEOWNER review enforced by the ruleset too, matching classic protection (repository-helpers#626) |
 | `merge_queue` with `merge_method: SQUASH` | Native GitHub merge queue (org default); `check_response_timeout_minutes: 15` |
+
+**Bypass actor:** the `OrganizationAdmin` role (written as `actor_id` **1**; GitHub's ruleset GET normalises it back to `null`, so the checker matches on `actor_type` + `bypass_mode`) with **`bypass_mode: pull_request`**. This mirrors the classic-protection owner review bypass so the org owner can still land a PR past `require_code_owner_review`. `bypass_mode` **must** be `pull_request`, not `always` — an `always` org-admin actor would also bypass `required_signatures` on a direct push to `main`, re-opening the repository-helpers#609 hole; the checker treats `always` as *not* a valid bypass (FAIL) and `--apply-fix` rewrites it to `pull_request`. `require_code_owner_review` without a `pull_request`-mode `OrganizationAdmin` bypass is **always a FAIL** — CODEOWNERS is a catch-all in every org repo and GitHub forbids self-approval, so that state locks `main`.
+
+GitHub rejects the Dependabot app as a ruleset bypass actor (`Actor integration must be part of the ruleset source or owner organization`), so **Dependabot auto-merge PRs are subject to `require_code_owner_review` like any other PR** — dep-updater usually lands the equivalent bump first; otherwise the owner reviews/merges the Dependabot PR. (Classic protection's `bypass_pull_request_allowances` still lists Dependabot; the ruleset is the binding constraint.)
 
 Graphite App bypass (`actor_id` **158384**) is **not** required for the org GitHub MQ profile. Leftover Graphite Integration bypass actors may be removed via `--apply-fix`.
 
 `required_signatures` needs every human contributor to have verified commit
 signing configured (`.cursor/rules/git-commit-identity.mdc` covers setup). GitHub
 signs the merge-queue / squash commits itself, so the queue keeps working.
-`--apply-fix` adds the rule to an existing ruleset.
+`--apply-fix` adds `required_signatures`, `require_code_owner_review`, and the
+bypass actors to an existing ruleset.
 
 Classic branch protection on **`main`** is also required (org standard). It complements the ruleset — reviews and CI — while **`protect-main`** enforces squash-only merges and GitHub `merge_queue`.
 

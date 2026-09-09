@@ -368,7 +368,8 @@ metadata, cursor rules, and uv Python CVE checks.
 
 `--apply-fix` can repair supported GitHub settings such as Release Please squash
 settings, the `protect-main` ruleset (squash-only + `merge_queue` SQUASH +
-`required_signatures`), and classic `main` branch protection (GitHub MQ profile). When run from the target
+`required_signatures` + `require_code_owner_review` with an `OrganizationAdmin`
+bypass), and classic `main` branch protection (GitHub MQ profile). When run from the target
 repository clone, it also prepares candidate workflow fixes in a dedicated
 `.worktrees/repo-practices-candidate-fixes-wt` worktree and submits them as a
 stack for review (`gt track` / `gt submit` when the marker is `graphite`, or
@@ -385,8 +386,9 @@ also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 | Check | Full audit | Merge-only | What it validates |
 | --- | --- | --- | --- |
 | Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
-| `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) + `required_signatures` on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding |
+| `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) + `required_signatures` + `pull_request` `require_code_owner_review` on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding |
 | `protect-main` `required_signatures` | yes* | yes | Ruleset rejects any push/merge with an unverified commit (*missing FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`; `--apply-fix` adds the rule — repository-helpers#609) |
+| `protect-main` `require_code_owner_review` | yes* | yes | Ruleset enforces CODEOWNER review (matching classic protection), with an `OrganizationAdmin` bypass (`bypass_mode: pull_request`) so the org owner can still land PRs (*missing rule FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`; rule present without the bypass FAILS always; `--apply-fix` adds both — repository-helpers#626) |
 | Main HEAD commit verification | yes* | — | Default-branch HEAD reports `commit.verification.verified` (bot authors skipped) (*missing verification FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`; no `--apply-fix` — repository-helpers#609) |
 | Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts; no Graphite-only push restrictions (GitHub MQ profile) |
 | GitHub merge queue wiring | yes | yes | `protect-main` `merge_queue`, `ci.yml` `merge_group`, dependabot auto-merge via `gh pr merge --auto` when `dependabot.yml` exists |
@@ -419,7 +421,7 @@ also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 | Actions hardening | yes* | — | `default_workflow_permissions: read` and `can_approve_pull_request_reviews: false` (`--apply-fix` sets both); `allowed_actions` and `sha_pinning_required` are SUGGEST-only always (no safe default to auto-apply) (*`default_workflow_permissions` / `can_approve_pull_request_reviews` FAIL under `--new-repo` and `--strict-onboarding`; SUGGEST in routine `--all` / `--suggest` — org-wide rollout complete, repository-helpers#588) |
 | Actions workflow `uses:` pinning | yes* | — | Third-party `uses:` refs pinned to a full commit SHA; a release/publish workflow (holds OIDC / write tokens) with a non-SHA pin is promoted past a generic suggestion (*generic non-SHA pins are SUGGEST always; release/publish workflow pins FAIL under `--new-repo` and `--strict-onboarding` — org-wide rollout complete, repository-helpers#588) |
 | Deployment environment protection | yes* | — | Any environment a workflow deploys to must have a protection rule (required reviewer) or a `deployment_branch_policy` (*missing FAILS `--new-repo` and `--strict-onboarding`; SUGGESTs in routine `--all` / `--suggest` — org-wide rollout complete, repository-helpers#588) |
-| Protection-mechanism consistency | yes | — | Advisory only: flags a genuine disagreement between classic `main` protection and the `protect-main` ruleset (e.g. `require_code_owner_reviews`) — this org runs both by design, so their coexistence is never itself flagged (repository-helpers#588) |
+| Protection-mechanism consistency | yes | — | Advisory only: flags a genuine disagreement between classic `main` protection and the `protect-main` ruleset — this org runs both by design, so their coexistence is never itself flagged. `require_code_owner_reviews` is now enforced on both sides (repository-helpers#626), so this check is normally quiet (repository-helpers#588) |
 
 `--suggest` prints remediation lines; `--apply-fix` queues candidate
 workflow/cursor-rule PRs via the stacking backend selected by

@@ -9,6 +9,15 @@ rp_DEFAULT_ORG='the-hcma'
 rp_GRAPHITE_APP_ACTOR_ID=158384
 rp_GRAPHITE_APP_SLUG='graphite-app'
 rp_DEPENDABOT_APP_SLUG='dependabot'
+# protect-main ruleset bypass actor for the org owner. actor_id 1 with actor_type
+# "OrganizationAdmin" is GitHub's fixed handle for the org-admin role. bypass_mode
+# "pull_request" lets an admin land a PR past require_code_owner_review while a
+# direct unsigned push to main is still rejected by required_signatures
+# (repository-helpers#626 / #609). GitHub rejects the Dependabot app as a ruleset
+# bypass actor ("must be part of the ruleset source or owner organization"), so
+# Dependabot auto-merge PRs need CODEOWNER review like any other PR — dep-updater
+# usually lands the equivalent bump first, otherwise the owner merges.
+rp_ORG_ADMIN_BYPASS_ACTOR_ID=1
 rp_ORG_OWNER_BYPASS_USER='thehcma'
 rp_THIS_REPO_NAME='repository-helpers'
 # GitHub merge-queue rule must squash (matches org Release Please / Graphite policy).
@@ -213,6 +222,7 @@ Audits GitHub conventions for org repositories:
   protect-main ruleset (when GitHub MQ, release-please.yml, or strict onboarding):
     - squash-only allowed_merge_methods on main
     - merge_queue rule (merge_method SQUASH) — org default enqueue path
+    - required_signatures; pull_request require_code_owner_review + OrganizationAdmin bypass
 
   Classic branch protection on main (same repos; org GitHub MQ profile):
     - CODEOWNERS reviews, dismiss stale, Dependabot bypass when present, owner bypass
@@ -5941,6 +5951,38 @@ rp_ruleset_has_github_merge_queue() {
   (( jq_exit_code == 0 ))
 }
 
+# rp_ruleset_has_org_admin_bypass <ruleset_json>
+# True when protect-main lets the OrganizationAdmin role bypass on pull requests,
+# so require_code_owner_review does not lock the org owner out of merging
+# (CODEOWNERS is a catch-all in every org repo and GitHub forbids self-approval).
+# bypass_mode must be "pull_request", not "always": an "always" org-admin actor
+# would also bypass required_signatures on a direct push to main, re-opening the
+# bootstrap hole repository-helpers#609 closed. Match ignores actor_id — the
+# org-admin role is a singleton and GitHub's ruleset GET normalises it to null
+# (writes still send actor_id 1).
+rp_ruleset_has_org_admin_bypass() {
+  local -r ruleset_json="${1:-}"
+  [[ -n "$ruleset_json" ]] || return 1
+  local jq_exit_code=0
+  rp_runner_jq_file "repo-practices ruleset has org-admin bypass" "$ruleset_json" \
+    -e '[.bypass_actors[]? | select(.actor_type == "OrganizationAdmin" and .bypass_mode == "pull_request")] | length > 0' \
+    >/dev/null || jq_exit_code=$?
+  (( jq_exit_code == 0 ))
+}
+
+# rp_ruleset_requires_code_owner_review <ruleset_json>
+# True when protect-main's pull_request rule sets require_code_owner_review, so
+# CODEOWNER review is enforced by the ruleset (not only by classic protection).
+rp_ruleset_requires_code_owner_review() {
+  local -r ruleset_json="${1:-}"
+  [[ -n "$ruleset_json" ]] || return 1
+  local jq_exit_code=0
+  rp_runner_jq_file "repo-practices ruleset requires code owner review" "$ruleset_json" \
+    -e '[.rules[]? | select(.type == "pull_request") | .parameters.require_code_owner_review] | first == true' \
+    >/dev/null || jq_exit_code=$?
+  (( jq_exit_code == 0 ))
+}
+
 # rp_ruleset_requires_signatures <ruleset_json>
 # True when protect-main includes a required_signatures rule (server-side reject
 # of any push/merge carrying an unverified commit).
@@ -5973,6 +6015,8 @@ rp_github_mq_ruleset_org_compliant() {
   [[ "$check_timeout_minutes" == "$rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES" ]] || return 1
 
   rp_ruleset_requires_signatures "$ruleset_json" || return 1
+  rp_ruleset_requires_code_owner_review "$ruleset_json" || return 1
+  rp_ruleset_has_org_admin_bypass "$ruleset_json" || return 1
 
   return 0
 }
@@ -6046,7 +6090,7 @@ rp_protect_main_create_payload() {
         "required_approving_review_count": 0,
         "dismiss_stale_reviews_on_push": false,
         "required_reviewers": [],
-        "require_code_owner_review": false,
+        "require_code_owner_review": true,
         "require_last_push_approval": false,
         "required_review_thread_resolution": false,
         "allowed_merge_methods": ["squash"]
@@ -6068,9 +6112,15 @@ rp_protect_main_create_payload() {
 }
 RULESET
 )"
+  # Inject the MQ check timeout and the org-owner bypass actor from constants so
+  # there is a single source of truth.
   rp_runner_jq_file "repo-practices protect-main create payload timeout" "$payload" \
     --argjson timeout "$rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES" \
-    '(.rules[] | select(.type == "merge_queue") | .parameters.check_response_timeout_minutes) = $timeout'
+    --argjson admin_id "$rp_ORG_ADMIN_BYPASS_ACTOR_ID" \
+    '(.rules[] | select(.type == "merge_queue") | .parameters.check_response_timeout_minutes) = $timeout
+     | .bypass_actors = [
+         {actor_id: $admin_id, actor_type: "OrganizationAdmin", bypass_mode: "pull_request"}
+       ]'
 }
 
 rp_apply_protect_main_create() {
@@ -7417,6 +7467,61 @@ rp_validate_github_merge_queue_ruleset() {
   return 1
 }
 
+# rp_validate_ruleset_code_owner_review <slug> <ruleset_json>
+# protect-main's pull_request rule must set require_code_owner_review so CODEOWNER
+# review is enforced by the ruleset, matching classic protection and clearing the
+# persistent rp_check_protection_mechanism_consistency SUGGEST
+# (repository-helpers#626). Rollout ratchet mirrors required_signatures
+# (repository-helpers#609): FAIL under --new-repo / --strict-onboarding, SUGGEST
+# in routine --all / --suggest. --apply-fix adds the rule (plus the mandatory
+# OrganizationAdmin bypass) via rp_apply_protect_main_github_mq_shape.
+#
+# The rule without an OrganizationAdmin bypass actor (bypass_mode: pull_request)
+# locks the org owner out of merging (CODEOWNERS is a catch-all in every org repo
+# and GitHub forbids self-approval), so that combination is ALWAYS a FAIL. An
+# OrganizationAdmin actor set to bypass_mode "always" does not count — it would
+# also bypass required_signatures on a direct push (repository-helpers#609) — and
+# --apply-fix rewrites it to "pull_request".
+rp_validate_ruleset_code_owner_review() {
+  local slug="$1"
+  local ruleset_json="$2"
+  local has_rule=0 has_bypass=0
+
+  if [[ -z "$ruleset_json" ]]; then
+    return 0
+  fi
+  if rp_ruleset_requires_code_owner_review "$ruleset_json"; then
+    has_rule=1
+  fi
+  if rp_ruleset_has_org_admin_bypass "$ruleset_json"; then
+    has_bypass=1
+  fi
+
+  if (( has_rule == 1 && has_bypass == 0 )); then
+    rp_log_fail \
+      "${slug}: protect-main requires CODEOWNER review with no OrganizationAdmin bypass (bypass_mode: pull_request) — org owner cannot merge; fix via --apply-fix (repository-helpers#626)"
+    return 1
+  fi
+  if (( has_rule == 1 )); then
+    return 0
+  fi
+
+  if [[ "$rp_strict_onboarding" -eq 1 || "$rp_new_repo" -eq 1 ]]; then
+    rp_log_fail \
+      "${slug}: protect-main pull_request rule must set require_code_owner_review (consolidate CODEOWNER review onto the ruleset)"
+    if [[ "$rp_suggest" -eq 1 ]]; then
+      rp_log_suggest \
+        "${slug}: add require_code_owner_review + OrganizationAdmin bypass to protect-main via --apply-fix"
+    fi
+    return 1
+  fi
+  if [[ "$rp_suggest" -eq 1 ]]; then
+    rp_log_suggest \
+      "${slug}: set protect-main require_code_owner_review + OrganizationAdmin bypass via --apply-fix (repository-helpers#626)"
+  fi
+  return 0
+}
+
 # rp_validate_ruleset_required_signatures <slug> <ruleset_json>
 # protect-main must include a required_signatures rule so GitHub rejects any
 # push or merge that carries an unverified commit (closes the direct-to-main
@@ -7886,15 +7991,31 @@ rp_apply_protect_main_github_mq_shape() {
   payload="$(rp_runner_jq_file "repo-practices github-mq ruleset payload" "$payload" \
     --arg method "$rp_GITHUB_MQ_MERGE_METHOD" \
     --argjson timeout "$rp_GITHUB_MQ_CHECK_RESPONSE_TIMEOUT_MINUTES" \
-    --argjson graphite_id "$rp_GRAPHITE_APP_ACTOR_ID" '
-    .bypass_actors = ((.bypass_actors // []) | map(
-      select(.actor_id != $graphite_id or .actor_type != "Integration")
-    ))
+    --argjson graphite_id "$rp_GRAPHITE_APP_ACTOR_ID" \
+    --argjson admin_id "$rp_ORG_ADMIN_BYPASS_ACTOR_ID" '
+    .bypass_actors = (
+      ((.bypass_actors // []) | map(
+        select(
+          (.actor_id != $graphite_id or .actor_type != "Integration")
+          # Drop an OrganizationAdmin actor whose bypass_mode is not
+          # "pull_request" (e.g. "always") so it is re-added below with the
+          # correct mode — "always" would also bypass required_signatures
+          # on a direct push (repository-helpers#609).
+          and (.actor_type != "OrganizationAdmin" or .bypass_mode == "pull_request")
+        )
+      )) as $kept
+      | $kept
+        + (if ($kept | any(.actor_type == "OrganizationAdmin"))
+           then []
+           else [{actor_id: $admin_id, actor_type: "OrganizationAdmin", bypass_mode: "pull_request"}]
+           end)
+    )
     | .rules = (
         (.rules // [])
         | map(
             if .type == "pull_request" then
               .parameters.allowed_merge_methods = ["squash"]
+              | .parameters.require_code_owner_review = true
             elif .type == "merge_queue" then
               .parameters.merge_method = $method
               | .parameters.max_entries_to_build = (.parameters.max_entries_to_build // 5)
@@ -8061,6 +8182,9 @@ rp_check_protect_main_ruleset() {
     repo_fail=1
   fi
   if ! rp_validate_ruleset_required_signatures "$slug" "$ruleset_json"; then
+    repo_fail=1
+  fi
+  if ! rp_validate_ruleset_code_owner_review "$slug" "$ruleset_json"; then
     repo_fail=1
   fi
   if ! rp_validate_graphite_bypass_json "$slug" "$ruleset_json"; then
