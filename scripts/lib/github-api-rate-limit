@@ -19,6 +19,13 @@
 #   GITHUB_API_SECONDARY_RATE_LIMIT_BACKOFF_S  comma-separated secondary cooldown
 #     ladder by attempt (default 60,180,300). Used when Retry-After / body guidance
 #     is absent for explicit secondary/abuse limits (repository-helpers#569).
+#   GITHUB_API_TRANSIENT_NETWORK_MAX_RETRIES   bounded retries for transport
+#     failures — DNS resolution, connection refused/reset, 502/503/504 — that are
+#     not rate limits (default 3; repository-helpers#617). Reads only; a detected
+#     mutation (non-GET `gh api`, a `gh api` body flag, a GraphQL `mutation`, or
+#     any non-read `gh` subcommand forwarded by scripts/gh-api) is never retried.
+#   GITHUB_API_TRANSIENT_NETWORK_BACKOFF_S     comma-separated backoff ladder by
+#     attempt for the above (default 2,5,15).
 
 set -euo pipefail
 
@@ -79,6 +86,161 @@ github_api_detail_is_secondary_rate_limited() {
     || "$lower" == *'was made too recently'* ]]
 }
 
+# github_api_detail_is_transient_network <detail>
+# True for retryable transport failures — DNS resolution, connection
+# refused/reset/timeout, unreachable network, TLS handshake, gateway 502/503/504.
+# These are NOT rate limits (which have their own wait ladder), so a brief outage
+# during a nightly run should retry rather than abort (repository-helpers#617).
+# Covers both `gh` and `git`/libcurl phrasings ("failed to connect to", "the
+# requested URL returned error: 503") since batch_run_git_fetch feeds raw
+# `git fetch` stderr in here.
+github_api_detail_is_transient_network() {
+  local -r detail="$1"
+  local -r lower="${detail,,}"
+
+  case "$lower" in
+    *'could not resolve host'* \
+      | *'could not resolve proxy'* \
+      | *'temporary failure in name resolution'* \
+      | *'error connecting to'* \
+      | *'failed to connect to'* \
+      | *'could not connect to'* \
+      | *"couldn't connect to"* \
+      | *'connection refused'* \
+      | *'connection reset'* \
+      | *'connection timed out'* \
+      | *'operation timed out'* \
+      | *'timeout was reached'* \
+      | *'network is unreachable'* \
+      | *'no route to host'* \
+      | *'tls handshake timeout'* \
+      | *'i/o timeout'* \
+      | *'unexpected eof'* \
+      | *'(http 502)'* | *'(http 503)'* | *'(http 504)'* \
+      | *'http 502'* | *'http 503'* | *'http 504'* \
+      | *'returned error: 502'* | *'returned error: 503'* \
+      | *'returned error: 504'* \
+      | *'bad gateway'* | *'service unavailable'* | *'gateway timeout'*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# _github_api_rl_cmd_is_write <cmd…>
+# Classify a gh invocation (possibly wrapped as `bash -c '…' … gh <args>` by
+# scripts/gh-api) as a mutation, so the transient-network retry is skipped for
+# it. scripts/gh-api forwards EVERY non-rejected gh subcommand through this same
+# wrapper, so inspecting `gh api` body/method flags alone is not enough
+# (repository-helpers#617 review):
+#
+#   gh api <path>       → read, unless the effective HTTP method is non-GET/HEAD.
+#                         `gh api` defaults to GET, but a body flag
+#                         (-f/-F/--field/--raw-field/--input) with no explicit
+#                         --method promotes it to POST. With an explicit
+#                         `--method GET` the same -f fields are query params, so
+#                         it stays a read (scripts/dep-updater does exactly this).
+#   gh api graphql …    → read, unless the payload mentions "mutation".
+#   gh <subcommand> …   → read only for an allowlisted read verb
+#                         (view/list/checks/diff/status) or `search`; every
+#                         other subcommand (pr merge, pr comment, issue close, …)
+#                         is treated as a mutation.
+_github_api_rl_cmd_is_write() {
+  local -a args=("$@")
+  local n i gh_idx=-1 sub verb prev arg method='' has_body=0
+
+  n=${#args[@]}
+  for (( i = 0; i < n; i++ )); do
+    if [[ "${args[i]}" == 'gh' || "${args[i]}" == */gh ]]; then
+      gh_idx=$i
+      break
+    fi
+  done
+  (( gh_idx >= 0 )) || return 0
+  sub="${args[gh_idx + 1]:-}"
+
+  if [[ "$sub" != 'api' ]]; then
+    verb="${args[gh_idx + 2]:-}"
+    case "${sub}:${verb}" in
+      search:* | *:view | *:list | *:checks | *:diff | *:status)
+        return 1 ;;
+      *)
+        return 0 ;;
+    esac
+  fi
+
+  if [[ "${args[gh_idx + 2]:-}" == 'graphql' ]]; then
+    for (( i = gh_idx + 3; i < n; i++ )); do
+      [[ "${args[i]}" == *mutation* ]] && return 0
+    done
+    return 1
+  fi
+
+  # Resolve the effective method and whether a request body is present, then
+  # decide — a body flag only makes it a POST when no method is set explicitly.
+  prev=''
+  for (( i = gh_idx + 2; i < n; i++ )); do
+    arg="${args[i]}"
+    case "$arg" in
+      -f | -F | --field | --raw-field | --input) has_body=1 ;;
+      -f* | -F* | --field=* | --raw-field=* | --input=*) has_body=1 ;;
+      --method=*) method="${arg#--method=}" ;;
+      -X*) verb="${arg#-X}"; method="${verb#=}" ;;
+    esac
+    if [[ "$prev" == '--method' || "$prev" == '-X' ]]; then
+      method="$arg"
+    fi
+    prev="$arg"
+  done
+
+  if [[ -n "$method" ]]; then
+    [[ "${method^^}" != 'GET' && "${method^^}" != 'HEAD' ]] && return 0
+    return 1
+  fi
+  (( has_body )) && return 0
+  return 1
+}
+
+# _github_api_transient_network_effective_max_retries
+# Re-reads GITHUB_API_TRANSIENT_NETWORK_MAX_RETRIES on each exec (per-call env).
+_github_api_transient_network_effective_max_retries() {
+  local value
+
+  value="${GITHUB_API_TRANSIENT_NETWORK_MAX_RETRIES:-3}"
+  if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < 1 )); then
+    value=3
+  fi
+  printf '%s' "$value"
+}
+
+# _github_api_transient_network_backoff_s <attempt>
+# Backoff ladder (1-indexed) for transient transport retries. Override with
+# GITHUB_API_TRANSIENT_NETWORK_BACKOFF_S=2,5,15 (comma-separated).
+_github_api_transient_network_backoff_s() {
+  local attempt="${1:-1}"
+  local csv="${GITHUB_API_TRANSIENT_NETWORK_BACKOFF_S:-2,5,15}"
+  local -a parts=()
+  local idx value
+
+  if [[ ! "$attempt" =~ ^[0-9]+$ ]] || (( attempt < 1 )); then
+    attempt=1
+  fi
+  IFS=',' read -r -a parts <<<"$csv"
+  ((${#parts[@]} > 0)) || parts=(2 5 15)
+  idx=$((attempt - 1))
+  if (( idx >= ${#parts[@]} )); then
+    idx=$((${#parts[@]} - 1))
+  fi
+  value="${parts[$idx]}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$value"
+  else
+    printf '5'
+  fi
+}
+
 # github_api_exec_with_rate_limit_retry <label> [--probe] -- <cmd> [args…]
 # Runs via runner_exec (no mid-attempt stdout stream). On success, prints that
 # attempt's captured stdout once — avoids concatenating partial --paginate pages
@@ -88,6 +250,7 @@ github_api_exec_with_rate_limit_retry() {
   local -a rl_cmd=()
   local exit_code attempt max_retries detail headers uuid should_wait wait_ec
   local final_quota_retry=0
+  local net_attempt=1 net_max_retries net_sleep
 
   label="${1:?github_api_exec_with_rate_limit_retry: label required}"
   shift
@@ -115,6 +278,7 @@ github_api_exec_with_rate_limit_retry() {
   }
 
   max_retries="$(_github_api_rate_limit_effective_max_retries)"
+  net_max_retries="$(_github_api_transient_network_effective_max_retries)"
 
   attempt=1
   while (( attempt <= max_retries || final_quota_retry == 1 )); do
@@ -133,6 +297,28 @@ github_api_exec_with_rate_limit_retry() {
     fi
     detail="$(_github_api_last_stderr_summary)"
     if ! github_api_detail_is_rate_limited "$detail"; then
+      # Transient transport failure (DNS, connection, gateway 5xx): bounded retry
+      # with backoff so a brief outage does not abort a nightly run (#617).
+      # Read requests only — a 5xx / timeout on a mutation could mean the write
+      # landed, and re-POSTing is not safe (remote-timeouts-retries.mdc).
+      if github_api_detail_is_transient_network "$detail"; then
+        if _github_api_rl_cmd_is_write "${rl_cmd[@]}"; then
+          printf 'NOTE: GITHUB_API_TRANSIENT_NETWORK_NO_RETRY label=%s reason=mutation detail=%s\n' \
+            "$label" "$detail" >&2
+        elif (( net_attempt < net_max_retries )); then
+          net_sleep="$(_github_api_transient_network_backoff_s "$net_attempt")"
+          printf 'NOTE: GITHUB_API_TRANSIENT_NETWORK label=%s attempt=%s/%s sleep=%ss detail=%s\n' \
+            "$label" "$net_attempt" "$net_max_retries" "$net_sleep" "$detail" >&2
+          if (( net_sleep > 0 )); then
+            run_command "github-api transient-network backoff sleep" sleep "$net_sleep" || true
+          fi
+          net_attempt=$(( net_attempt + 1 ))
+          continue
+        else
+          printf 'ERROR: GITHUB_API_TRANSIENT_NETWORK label=%s attempts=%s detail=%s\n' \
+            "$label" "$net_max_retries" "$detail" >&2
+        fi
+      fi
       return "$exit_code"
     fi
     # Post-ladder re-run already consumed; fail closed.

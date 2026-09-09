@@ -69,6 +69,9 @@ trap batch_run_cleanup_temp_files EXIT
 # shellcheck disable=SC1091
 source "${script_dir}/lib/runner-bootstrap"
 
+# shellcheck disable=SC1091  # github_api_detail_is_transient_network for git-fetch retry
+source "${script_dir}/lib/github-api-rate-limit"
+
 # shellcheck disable=SC1091
 source "${script_dir}/lib/timer-singleton-lock"
 
@@ -288,9 +291,13 @@ mail_smtp_host="${!mail_smtp_host_var}"
 readonly mail_smtp_host
 
 # batch_run_git_fetch <repo_path>
+# Retries a transient transport failure (DNS/connection/gateway) a bounded number
+# of times with backoff — a brief 3am network blip must not abort the whole batch
+# (repository-helpers#617). Non-transient failures fail on the first attempt.
 batch_run_git_fetch() {
   local -r git_dir="$1"
   local name fetch_exit fetch_uuid fetch_stderr rev_exit
+  local attempt max_attempts backoff_s
 
   rev_exit=0
   runner_exec "git rev-parse work-tree check" -- git -C "$git_dir" rev-parse --is-inside-work-tree \
@@ -300,21 +307,42 @@ batch_run_git_fetch() {
   fi
 
   name="$(basename "$git_dir")"
+  max_attempts="${DEP_UPDATER_BATCH_FETCH_MAX_ATTEMPTS:-3}"
+  if [[ ! "$max_attempts" =~ ^[0-9]+$ ]] || (( max_attempts < 1 )); then
+    max_attempts=3
+  fi
+
   printf '[batch-run] git fetch origin (%s)…\n' "$name" >&2
-  fetch_exit=0
-  run_command "git fetch: ${name}" git -C "$git_dir" fetch --prune origin || fetch_exit=$?
-  if [[ "$fetch_exit" -ne 0 ]]; then
-    printf 'WARNING: git fetch failed for %s (exit %d)\n' "$name" "$fetch_exit" >&2
+  for (( attempt = 1; attempt <= max_attempts; attempt++ )); do
+    fetch_exit=0
+    run_command "git fetch: ${name}" git -C "$git_dir" fetch --prune origin || fetch_exit=$?
+    if (( fetch_exit == 0 )); then
+      return 0
+    fi
+
     fetch_uuid="$(runner_last_id)"
+    fetch_stderr=""
     if [[ -n "$fetch_uuid" ]]; then
       fetch_stderr="$(runner_read "$fetch_uuid" stderr 2>/dev/null || true)"
-      if [[ -n "$fetch_stderr" ]]; then
-        printf '%s\n' "$fetch_stderr" >&2
-      fi
+    fi
+
+    if (( attempt < max_attempts )) \
+      && github_api_detail_is_transient_network "$fetch_stderr"; then
+      backoff_s=$(( attempt * 5 ))
+      printf 'NOTE: BATCH_FETCH_TRANSIENT %s attempt=%d/%d sleep=%ds\n' \
+        "$name" "$attempt" "$max_attempts" "$backoff_s" >&2
+      run_command "git fetch transient backoff sleep" sleep "$backoff_s" || true
+      continue
+    fi
+
+    printf 'WARNING: git fetch failed for %s (exit %d, attempt %d/%d)\n' \
+      "$name" "$fetch_exit" "$attempt" "$max_attempts" >&2
+    if [[ -n "$fetch_stderr" ]]; then
+      printf '%s\n' "$fetch_stderr" >&2
     fi
     return 1
-  fi
-  return 0
+  done
+  return 1
 }
 
 # batch_run_git_fetch_all

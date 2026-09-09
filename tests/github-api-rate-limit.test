@@ -124,6 +124,39 @@ else
   fail_case "auth failure wrongly classified as rate limit"
 fi
 
+printf '\n=== behavioural: transient-network detection (#617) ===\n'
+for phrase in \
+  'fatal: unable to access '"'"'https://github.com/x.git/'"'"': Could not resolve host: github.com' \
+  'error connecting to api.github.com' \
+  'GraphQL: Something went wrong (HTTP 502)' \
+  'HTTP 503: Service Unavailable' \
+  'net/http: TLS handshake timeout' \
+  'dial tcp: connection refused' \
+  'fatal: unable to access ...: Failed to connect to github.com port 443: Connection refused' \
+  'fatal: unable to access ...: Failed to connect to github.com port 443 after 130000 ms' \
+  "curl: (7) Couldn't connect to server" \
+  'fatal: unable to access ...: The requested URL returned error: 503' \
+  'error: RPC failed; The requested URL returned error: 502'
+do
+  if github_api_detail_is_transient_network "$phrase"; then
+    pass_case "transient-network: '${phrase:0:40}...'"
+  else
+    fail_case "transient-network missed: $phrase"
+  fi
+done
+for phrase in \
+  'API rate limit exceeded for user ID 1' \
+  'HTTP 404: Not Found' \
+  'HTTP 401 Bad credentials' \
+  'You have exceeded a secondary rate limit'
+do
+  if github_api_detail_is_transient_network "$phrase"; then
+    fail_case "transient-network false positive: $phrase"
+  else
+    pass_case "transient-network ignores: '${phrase:0:40}'"
+  fi
+done
+
 printf '\n=== behavioural: header backoff parse ===\n'
 hdr=$'HTTP/2.0 403 Forbidden\r\nRetry-After: 42\r\nX-RateLimit-Reset: 2000000000\r\n\r\n{}'
 if [[ "$(_github_api_header_value "$hdr" 'retry-after')" == '42' ]]; then
@@ -332,6 +365,167 @@ if (( ec == 0 )) \
   pass_case "retries after wait and succeeds when quota returns"
 else
   fail_case "retry-success path broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+printf '\n=== behavioural: transient-network retry then success (#617) ===\n'
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+state_file="${MOCK_GH_STATE:?}"
+n=0
+[[ -f "$state_file" ]] && n="$(cat "$state_file")"
+n=$((n + 1))
+printf '%s' "$n" >"$state_file"
+if (( n < 3 )); then
+  printf 'gh: error connecting to api.github.com\n' >&2
+  exit 1
+fi
+printf '{"login":"ok"}\n'
+EOF
+chmod +x "${mock_bin}/gh"
+state="$(mktemp)"; printf '0' >"$state"
+
+set +e
+out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" MOCK_GH_STATE="$state" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      GITHUB_API_TRANSIENT_NETWORK_BACKOFF_S=0 \
+        github_api_exec_with_rate_limit_retry "test-net" -- gh api user
+    ' 2>&1
+)"
+ec=$?
+set -e
+if (( ec == 0 )) \
+  && grep -qF 'NOTE: GITHUB_API_TRANSIENT_NETWORK' <<<"$out" \
+  && grep -qF '{"login":"ok"}' <<<"$out"; then
+  pass_case "transient-network error retried, then command succeeds"
+else
+  fail_case "transient-network retry-success broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+printf '\n=== behavioural: transient-network retry exhaustion (#617) ===\n'
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'gh: Could not resolve host: api.github.com\n' >&2
+exit 1
+EOF
+chmod +x "${mock_bin}/gh"
+
+set +e
+out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      GITHUB_API_TRANSIENT_NETWORK_BACKOFF_S=0 \
+      GITHUB_API_TRANSIENT_NETWORK_MAX_RETRIES=2 \
+        github_api_exec_with_rate_limit_retry "test-net-exhaust" -- gh api user
+    ' 2>&1
+)"
+ec=$?
+set -e
+if (( ec != 0 )) \
+  && grep -qF 'ERROR: GITHUB_API_TRANSIENT_NETWORK' <<<"$out" \
+  && [[ "$(grep -cF 'NOTE: GITHUB_API_TRANSIENT_NETWORK' <<<"$out")" == '1' ]]; then
+  pass_case "transient-network retries are bounded, then ERROR: GITHUB_API_TRANSIENT_NETWORK"
+else
+  fail_case "transient-network exhaustion broken (ec=${ec})"
+  printf '%s\n' "$out"
+fi
+
+printf '\n=== behavioural: mutation classification (#617 review) ===\n'
+# Mutations — must be classified as writes (no transient retry).
+for w in \
+  'gh api --method POST repos/x' \
+  'gh api -X DELETE repos/x' \
+  'gh api --method=PATCH repos/x' \
+  'gh api -XPOST repos/x' \
+  'gh api -X=DELETE repos/x' \
+  'gh api -f a=b repos/x' \
+  'gh api --field a=b repos/x' \
+  'gh api -fname=value repos/x' \
+  'gh api -F@/tmp/body repos/x' \
+  'gh api --input /tmp/p repos/x' \
+  'gh api --method POST -f a=b repos/x' \
+  'gh api graphql -f query=mutation{addComment}' \
+  'gh pr merge 618 --auto --squash' \
+  'gh pr comment 618 --body lgtm' \
+  'gh pr edit 618 --add-label x' \
+  'gh issue close 42' \
+  'gh release create v1' \
+  'bash -c exec /tmp/f gh api --method POST repos/x'; do
+  # shellcheck disable=SC2086  # deliberate word-split of the test fixture arg list
+  if _github_api_rl_cmd_is_write $w; then
+    pass_case "mutation detected: $w"
+  else
+    fail_case "mutation missed: $w"
+  fi
+done
+# Reads — must NOT be classified as writes (transient retry applies).
+for r in \
+  'gh api repos/x --paginate' \
+  'gh api --method GET repos/x' \
+  'gh api -X HEAD repos/x' \
+  'gh api -XGET repos/x' \
+  'gh api --method GET -f state=open -f head=x repos/x/pulls' \
+  'gh api -XGET -f a=b repos/x' \
+  'gh api user --jq .login' \
+  'gh api graphql -f query={repository{name}}' \
+  'gh pr view 618 --json state' \
+  'gh pr checks 618' \
+  'gh pr list --state open' \
+  'gh run view 123' \
+  'gh search issues x' \
+  'bash -c exec /tmp/f gh api repos/x'; do
+  # shellcheck disable=SC2086  # deliberate word-split of the test fixture arg list
+  if _github_api_rl_cmd_is_write $r; then
+    fail_case "read misclassified as mutation: $r"
+  else
+    pass_case "read not a mutation: $r"
+  fi
+done
+
+printf '\n=== behavioural: transient-network on a mutation is NOT retried (#617 review) ===\n'
+call_log2="$(mktemp)"
+cat >"${mock_bin}/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '1\n' >>"${MOCK_GH_CALL_LOG:?}"
+printf 'gh: Could not resolve host: api.github.com\n' >&2
+exit 1
+EOF
+chmod +x "${mock_bin}/gh"
+: >"$call_log2"
+
+set +e
+out="$(
+  PATH="${mock_bin}:/usr/bin:/bin" MOCK_GH_CALL_LOG="${call_log2}" \
+    bash -c '
+      root="'"$root"'"
+      source "${root}/scripts/lib/runner-bootstrap"
+      source "${root}/scripts/lib/github-api-rate-limit"
+      GITHUB_API_TRANSIENT_NETWORK_BACKOFF_S=0 \
+        github_api_exec_with_rate_limit_retry "test-net-write" -- \
+          gh api --method POST repos/the-hcma/x/git/refs -f ref=refs/heads/y
+    ' 2>&1
+)"
+ec=$?
+set -e
+calls2="$(wc -l <"${call_log2}" | tr -d ' ')"
+if (( ec != 0 )) \
+  && [[ "$calls2" == '1' ]] \
+  && grep -qF 'GITHUB_API_TRANSIENT_NETWORK_NO_RETRY' <<<"$out" \
+  && ! grep -qF 'attempt=1/' <<<"$out"; then
+  pass_case "transient-network on a POST is not retried (single call, NO_RETRY note)"
+else
+  fail_case "mutation transient no-retry broken (ec=${ec} calls=${calls2})"
   printf '%s\n' "$out"
 fi
 
