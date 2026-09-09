@@ -162,6 +162,21 @@ else
   fail=$(( fail + 1 ))
 fi
 
+printf '\n=== static: git fetch retries transient transport failures (#617) ===\n'
+# shellcheck disable=SC2016  # static assert matches literal source text, not expanded vars
+if grep -qF 'lib/github-api-rate-limit' "$script" \
+  && grep -qF 'github_api_detail_is_transient_network "$fetch_stderr"' "$script" \
+  && grep -qF 'DEP_UPDATER_BATCH_FETCH_MAX_ATTEMPTS' "$script" \
+  && grep -qF 'NOTE: BATCH_FETCH_TRANSIENT' "$script" \
+  && awk '/^batch_run_git_fetch\(\) \{/{f=1} f && /^\}$/{exit} f' "$script" \
+    | grep -qE 'for \(\( attempt = 1; attempt <= max_attempts'; then
+  printf '[PASS] batch-run: bounded transient-network retry around git fetch\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] batch-run: git fetch missing bounded transient-network retry\n'
+  fail=$(( fail + 1 ))
+fi
+
 printf '\n=== static: batch-run runner adoption complete ===\n'
 # shellcheck disable=SC2016  # static assert matches literal source text
 if grep -qF 'runner_exec "git rev-parse work-tree check"' "$script" \
