@@ -9,6 +9,11 @@
 # On failure, prints ERROR: ENVIRONMENT_APPROVAL_FAILED and exits 1. Coding
 # agents MUST raise that to the operator immediately — do not keep polling.
 #
+# Superseded runs (a force-push cancels the old run, but the PR statusCheckRollup
+# can still list it as WAITING for a short window) and environments that are
+# already approved (HTTP 422 "already been approved or rejected") are tolerated,
+# not treated as ENVIRONMENT_APPROVAL_FAILED.
+#
 # Usage:
 #   scripts/dev/approve-pending-deployments --pr <number>
 #   scripts/dev/approve-pending-deployments --help
@@ -25,10 +30,13 @@ source "${script_dir}/../lib/github-api-rate-limit"
 readonly apd_approve_comment='Approved on operator behalf (coding agent, gh is the operator)'
 
 pr_number=""
+# Set by approve_run_once when a pending environment cannot be approved by this
+# gh identity; reset at the top of each approve_run call.
+approve_run_saw_unapprovable=0
 
 usage() {
   runner_sh_stdout "approve-pending-deployments usage" -- \
-    "sed -n '2,14p' $(printf '%q' "${BASH_SOURCE[0]}") | sed 's/^# \{0,1\}//'"
+    "sed -n '2,19p' $(printf '%q' "${BASH_SOURCE[0]}") | sed 's/^# \{0,1\}//'"
 }
 
 die() {
@@ -107,15 +115,50 @@ waiting_run_ids() {
   fi
 }
 
-# approve_run <slug> <run_id>
-# Approves pending deployments the current user can approve. Returns 1 if any
-# pending environment is not approvable, or if the approve API fails.
-approve_run() {
+# approve_run_last_stderr
+# First non-empty stderr line captured from the most recent runner command
+# (used to classify a failed approval POST — e.g. the 422 already-approved race).
+approve_run_last_stderr() {
+  local uuid
+  uuid="$(runner_last_id)"
+  [[ -n "$uuid" ]] || return 0
+  runner_read "$uuid" stderr 2>/dev/null | grep -m1 '.' || true
+}
+
+# run_is_live <slug> <run_id>
+# Exit 0 unless the Actions run reports a terminal status (completed/cancelled),
+# i.e. it was superseded by a newer run. A GitHub API error is treated as live
+# (exit 0) so a transient failure never silently skips a real WAITING run.
+run_is_live() {
   local -r slug="$1"
   local -r run_id="$2"
-  local pending tmp parse_tmp ids_json body exit_code
+  local status exit_code=0
+
+  # Keep gh on the same line as the waiter (runner-adoption + gh-api waiter ratchets).
+  status="$(github_api_exec_with_rate_limit_retry "approve-pending-deployments run status" -- gh api \
+    "repos/${slug}/actions/runs/${run_id}" --jq '.status // empty')" || exit_code=$?
+  if (( exit_code != 0 )) || [[ -z "$status" ]]; then
+    return 0
+  fi
+  case "$status" in
+    queued|in_progress|waiting|pending|requested|action_required) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# approve_run_once <slug> <run_id>
+# One list -> parse -> approve cycle. Sets approve_run_saw_unapprovable=1 when a
+# pending environment cannot be approved by this gh identity. Returns:
+#   0  approvable environments approved (or nothing pending)
+#   1  hard failure (list / parse / approve API error)
+#   2  the approve POST was rejected with 422 "already approved or rejected" —
+#      at least one submitted environment was decided concurrently; the caller
+#      should re-query and approve whatever remains
+approve_run_once() {
+  local -r slug="$1"
+  local -r run_id="$2"
+  local pending tmp parse_tmp ids_json body exit_code approve_stderr
   local -a env_ids=()
-  local blocked=0
   local env_name env_id can_approve
 
   exit_code=0
@@ -149,13 +192,13 @@ approve_run() {
     else
       printf 'ERROR: cannot approve environment %s on run %s (gh user is not a reviewer)\n' \
         "$env_name" "$run_id" >&2
-      blocked=1
+      approve_run_saw_unapprovable=1
     fi
   done <"$parse_tmp"
   rm -f "$parse_tmp"
 
   if [[ "${#env_ids[@]}" -eq 0 ]]; then
-    return "$blocked"
+    return 0
   fi
 
   ids_json="$(IFS=,; printf '%s' "${env_ids[*]}")"
@@ -169,10 +212,57 @@ approve_run() {
     "repos/${slug}/actions/runs/${run_id}/pending_deployments" --input "$tmp" >/dev/null || exit_code=$?
   rm -f "$tmp"
   if (( exit_code != 0 )); then
+    approve_stderr="$(approve_run_last_stderr)"
+    # 422 "At least one environment has already been approved or rejected":
+    # GitHub rejects the whole POST when *any* submitted environment was already
+    # decided. That does not mean the run is fully approved — a second pending
+    # environment (multi-env deploy, or a repo-lint run with an extra env) is
+    # still WAITING. Signal the caller to re-query rather than declaring success.
+    if [[ "$approve_stderr" == *[Aa]lready\ been\ approved\ or\ rejected* ]]; then
+      return 2
+    fi
     printf 'ERROR: failed to approve pending deployments on run %s\n' "$run_id" >&2
     return 1
   fi
-  return "$blocked"
+  return 0
+}
+
+# approve_run <slug> <run_id>
+# Skips a superseded run. Otherwise approves every pending environment this gh
+# identity can approve. On a 422 "already approved or rejected" it re-queries
+# once and approves whatever is still pending (so the surviving environment of a
+# multi-env run is not left WAITING); a run that still rejects approval after
+# that is a hard failure. Returns 1 when a pending environment cannot be
+# approved, or on API failure.
+approve_run() {
+  local -r slug="$1"
+  local -r run_id="$2"
+  local once_ec=0
+
+  approve_run_saw_unapprovable=0
+
+  if ! run_is_live "$slug" "$run_id"; then
+    log_step "Skipping run ${run_id} (superseded — no longer live)"
+    return 0
+  fi
+
+  approve_run_once "$slug" "$run_id" || once_ec=$?
+  if (( once_ec == 2 )); then
+    log_step "Run ${run_id}: an environment was already decided — re-checking pending deployments"
+    once_ec=0
+    approve_run_once "$slug" "$run_id" || once_ec=$?
+    if (( once_ec == 2 )); then
+      printf 'ERROR: run %s still rejects approval after re-checking pending deployments\n' "$run_id" >&2
+      return 1
+    fi
+  fi
+  if (( once_ec != 0 )); then
+    return 1
+  fi
+  if (( approve_run_saw_unapprovable == 1 )); then
+    return 1
+  fi
+  return 0
 }
 
 parse_args() {
