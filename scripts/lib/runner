@@ -68,15 +68,37 @@ runner_session_default_root() {
   printf '%s\n' "${RUNNER_SESSION_ROOT:-${HOME}/scratch/repository-helpers/runner-sessions}"
 }
 
+# _runner_rc_is_timeout <exit-status>
+# True for a GNU timeout(1) expiry: 124 (killed by the default SIGTERM) or
+# 137 (128 + SIGKILL, when --kill-after escalates).
+_runner_rc_is_timeout() {
+  (( $1 == 124 || $1 == 137 ))
+}
+
 # runner_session_prune_stale
 # Removes session directories older than RUNNER_SESSION_MAX_AGE_DAYS (default 3).
-# Best-effort; never fails the caller.
+#
+# Bounded and best-effort: this runs on every runner_session_begin, so a large
+# backlog on slow storage (NFS) must never stall session startup. Removal runs in
+# parallel under a per-call wall-clock budget and a delete cap; any leftover
+# backlog drains over subsequent runs. Never fails the caller
+# (repository-helpers#616).
+#
+#   RUNNER_SESSION_PRUNE_MAX_SECONDS   wall-clock budget per call (default 15)
+#   RUNNER_SESSION_PRUNE_MAX_DELETES   delete cap per call        (default 200)
+#   RUNNER_SESSION_PRUNE_PARALLELISM   concurrent removals        (default 16)
 runner_session_prune_stale() {
-  local root max_days active_dir
+  local root max_days active_dir budget_s max_deletes parallelism
+  local timeout_bin collected remove_rc line enum_rc list_file started remaining
+  local truncated=0
+  local -a stale=()
 
   root="$(runner_session_default_root)"
   max_days="${RUNNER_SESSION_MAX_AGE_DAYS:-3}"
   active_dir="${RUNNER_SESSION_DIR:-}"
+  budget_s="${RUNNER_SESSION_PRUNE_MAX_SECONDS:-15}"
+  max_deletes="${RUNNER_SESSION_PRUNE_MAX_DELETES:-200}"
+  parallelism="${RUNNER_SESSION_PRUNE_PARALLELISM:-16}"
 
   if [[ ! "$max_days" =~ ^[0-9]+$ ]] || (( max_days < 1 )); then
     return 0
@@ -84,15 +106,92 @@ runner_session_prune_stale() {
   if [[ ! -d "$root" ]]; then
     return 0
   fi
+  if [[ ! "$budget_s" =~ ^[0-9]+$ ]] || (( budget_s < 1 )); then
+    budget_s=15
+  fi
+  if [[ ! "$max_deletes" =~ ^[0-9]+$ ]] || (( max_deletes < 1 )); then
+    max_deletes=200
+  fi
+  if [[ ! "$parallelism" =~ ^[0-9]+$ ]] || (( parallelism < 1 )); then
+    parallelism=16
+  fi
 
-  find "$root" -mindepth 1 -maxdepth 1 -type d -name 'session.*' -mtime "+${max_days}" 2>/dev/null \
-    | while IFS= read -r old_dir; do
-      [[ -n "$old_dir" ]] || continue
-      if [[ -n "$active_dir" && "$old_dir" == "$active_dir" ]]; then
-        continue
-      fi
-      rm -rf -- "$old_dir" 2>/dev/null || true
-    done
+  # Without timeout(1)/gtimeout(1) there is no way to cap the find walk or the
+  # removal, so a wedged-NFS session root could block runner_session_begin
+  # indefinitely — the exact failure this bound exists to prevent. Skip the sweep
+  # entirely; the backlog drains once GNU coreutils is on PATH (AGENTS.md expects
+  # tooling_path_ensure_gnu_userland to provide it). repository-helpers#616.
+  timeout_bin="$(runner_timeout_bin 2>/dev/null || true)"
+  if [[ -z "$timeout_bin" ]]; then
+    return 0
+  fi
+  started="$SECONDS"
+
+  # Enumerate stale session dirs, stopping once the delete cap is reached. The
+  # enumeration itself walks (and stat()s) the whole session root, so bound it
+  # with the shared budget. `find` writes to a file rather than a `< <(…)`
+  # process substitution so its exit status (124 on timeout) survives to the
+  # NOTE decision below (repository-helpers#616).
+  #
+  # The find/xargs/rm calls below run bare (not via run_command): this is
+  # session-lifecycle plumbing that executes before runner capture exists, so
+  # scripts/lib/runner is on the runner-adoption ratchet skip list.
+  enum_rc=0
+  list_file="$(mktemp 2>/dev/null || true)"
+  if [[ -z "$list_file" ]]; then
+    return 0
+  fi
+  # --kill-after: escalate to SIGKILL if the walk ignores SIGTERM, so timeout(1)
+  # itself never blocks in waitpid on a wedged process (matches runner_exec).
+  "$timeout_bin" --kill-after="${_runner_timeout_kill_after_sec}" "${budget_s}s" \
+    find "$root" -mindepth 1 -maxdepth 1 -type d -name 'session.*' \
+    -mtime "+${max_days}" >"$list_file" 2>/dev/null || enum_rc=$?
+
+  # Take at most max_deletes; note when the list held more so the INCOMPLETE NOTE
+  # fires only on a genuine overflow, not on an exactly-full sweep.
+  collected=0
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ -n "$active_dir" && "$line" == "$active_dir" ]]; then
+      continue
+    fi
+    if (( collected >= max_deletes )); then
+      truncated=1
+      break
+    fi
+    stale+=("$line")
+    collected=$(( collected + 1 ))
+  done < "$list_file"
+  rm -f "$list_file"
+
+  if (( ${#stale[@]} == 0 )); then
+    if _runner_rc_is_timeout "$enum_rc"; then
+      printf 'NOTE: RUNNER_SESSION_PRUNE_INCOMPLETE enumeration hit the %ss budget before listing any stale dir; backlog drains on later runs\n' \
+        "$budget_s" >&2
+    fi
+    return 0
+  fi
+
+  # Parallel best-effort removal under whatever remains of the shared wall-clock
+  # budget (a slow enumeration must not buy a second full budget).
+  remaining=$(( budget_s - (SECONDS - started) ))
+  if (( remaining < 1 )); then
+    remaining=1
+  fi
+  remove_rc=0
+  printf '%s\0' "${stale[@]}" \
+    | "$timeout_bin" --kill-after="${_runner_timeout_kill_after_sec}" "${remaining}s" \
+        xargs -0 -r -P "$parallelism" -n 1 rm -rf -- 2>/dev/null \
+    || remove_rc=$?
+
+  # Observable when a bound stopped the sweep short — the backlog is not lost, it
+  # drains on later runs.
+  if _runner_rc_is_timeout "$enum_rc" || _runner_rc_is_timeout "$remove_rc" \
+    || (( truncated )); then
+    printf 'NOTE: RUNNER_SESSION_PRUNE_INCOMPLETE swept=%s stale dirs (cap=%s budget=%ss); remaining backlog drains on later runs\n' \
+      "${#stale[@]}" "$max_deletes" "$budget_s" >&2
+  fi
+  return 0
 }
 
 # runner_session_begin
