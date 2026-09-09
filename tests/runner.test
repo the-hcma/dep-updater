@@ -59,6 +59,35 @@ assert_lib_grep "declares runner_failures_to_json" "runner_failures_to_json()"
 assert_lib_grep "declares runner_report_append_command_failures" "runner_report_append_command_failures()"
 assert_lib_grep "declares runner probe artifact" "_runner_artifact_probe='probe'"
 assert_lib_grep "declares runner_timeout_bin" "runner_timeout_bin()"
+# Bounded prune (repository-helpers#616): budget + cap + parallel removal.
+assert_lib_grep "prune honours a wall-clock budget" "RUNNER_SESSION_PRUNE_MAX_SECONDS"
+assert_lib_grep "prune honours a delete cap" "RUNNER_SESSION_PRUNE_MAX_DELETES"
+assert_lib_grep "prune removes in parallel" "xargs -0 -r -P"
+assert_lib_grep "prune surfaces an incomplete sweep" "RUNNER_SESSION_PRUNE_INCOMPLETE"
+# The enumeration exit status (124 on timeout) must survive to the NOTE decision,
+# and enumerate+remove must share one wall-clock budget, not two.
+assert_lib_grep "prune captures the enumeration exit status" "enum_rc"
+assert_lib_grep "prune folds timeout + overflow into the NOTE" "_runner_rc_is_timeout"
+assert_lib_grep "timeout classifier covers the SIGKILL escalation" "128 + SIGKILL"
+if awk '/^runner_session_prune_stale\(\) \{/{f=1} f && /^\}$/{exit} f' "$lib" \
+  | grep -qF -- '--kill-after='; then
+  pass_case "prune escalates timeout(1) with --kill-after"
+else
+  fail_case "prune escalates timeout(1) with --kill-after"
+fi
+assert_lib_grep "prune shares one budget across enumerate and remove" "budget_s - (SECONDS - started)"
+if awk '/^runner_session_prune_stale\(\) \{/{f=1} f && /^\}$/{exit} f' "$lib" \
+  | grep -qF 'there is no way to cap the find walk'; then
+  pass_case "prune returns early when no timeout(1) is available"
+else
+  fail_case "prune returns early when no timeout(1) is available"
+fi
+if awk '/^runner_session_prune_stale\(\) \{/{f=1} f && /^\}$/{exit} f' "$lib" \
+  | grep -qE '^\s+while IFS= read -r old_dir; do'; then
+  fail_case "prune no longer uses the unbounded serial while-loop"
+else
+  pass_case "prune no longer uses the unbounded serial while-loop"
+fi
 assert_lib_grep "declares runner_validate_timeout_sec" "runner_validate_timeout_sec()"
 assert_lib_grep "supports --timeout" "--timeout requires SECONDS"
 assert_lib_grep "uses GNU timeout --kill-after" "--kill-after="
@@ -447,6 +476,115 @@ else
 fi
 runner_session_end 2>/dev/null || true
 unset RUNNER_SESSION_DIR RUNNER_SESSION_ROOT RUNNER_SESSION_MAX_AGE_DAYS
+rm -rf "$scratch_root"
+
+# --- bounded prune (repository-helpers#616) -------------------------------
+unset RUNNER_SESSION_DIR
+scratch_root="${TMPDIR:-/tmp}/runner-prune-bound-test-$$"
+rm -rf "$scratch_root"
+mkdir -p "$scratch_root"
+# shellcheck disable=SC2031  # prior #556 concurrent subshells used their own roots
+export RUNNER_SESSION_ROOT="$scratch_root"
+export RUNNER_SESSION_MAX_AGE_DAYS=3
+
+for i in 1 2 3 4 5 6; do
+  mkdir -p "${scratch_root}/session.old${i}"
+  touch -t 202001010000 "${scratch_root}/session.old${i}" 2>/dev/null || true
+done
+
+export RUNNER_SESSION_PRUNE_MAX_DELETES=2
+prune_out="$(runner_session_prune_stale 2>&1 || true)"
+unset RUNNER_SESSION_PRUNE_MAX_DELETES
+
+remaining=0
+for i in 1 2 3 4 5 6; do
+  [[ -d "${scratch_root}/session.old${i}" ]] && remaining=$(( remaining + 1 ))
+done
+if (( remaining == 4 )); then
+  pass_case "prune honours RUNNER_SESSION_PRUNE_MAX_DELETES (2 removed, 4 left)"
+else
+  fail_case "prune delete cap: expected 4 dirs left, got $remaining"
+fi
+assert_contains "prune reports the capped sweep on stderr" \
+  "$prune_out" "RUNNER_SESSION_PRUNE_INCOMPLETE"
+
+# Exactly-at-cap is a complete sweep, not an overflow — no NOTE (mergestorm r3).
+rm -rf "${scratch_root:?}"/session.*
+for i in 1 2; do
+  mkdir -p "${scratch_root}/session.exact${i}"
+  touch -t 202001010000 "${scratch_root}/session.exact${i}" 2>/dev/null || true
+done
+export RUNNER_SESSION_PRUNE_MAX_DELETES=2
+exact_out="$(runner_session_prune_stale 2>&1 || true)"
+unset RUNNER_SESSION_PRUNE_MAX_DELETES
+exact_left=0
+for i in 1 2; do [[ -d "${scratch_root}/session.exact${i}" ]] && exact_left=$(( exact_left + 1 )); done
+if (( exact_left == 0 )) && ! grep -qF 'RUNNER_SESSION_PRUNE_INCOMPLETE' <<<"$exact_out"; then
+  pass_case "prune does not report INCOMPLETE when the stale count equals the cap"
+else
+  fail_case "prune exact-cap: left=$exact_left out='$exact_out'"
+fi
+
+# Active session dir is never removed, even when it looks stale.
+active_stale="${scratch_root}/session.active"
+mkdir -p "$active_stale"
+touch -t 202001010000 "$active_stale" 2>/dev/null || true
+export RUNNER_SESSION_DIR="$active_stale"
+runner_session_prune_stale >/dev/null 2>&1 || true
+unset RUNNER_SESSION_DIR
+if [[ -d "$active_stale" ]]; then
+  pass_case "prune never removes the active RUNNER_SESSION_DIR"
+else
+  fail_case "prune removed the active RUNNER_SESSION_DIR"
+fi
+
+# Nothing stale left → no NOTE, clean exit.
+rm -rf "${scratch_root:?}"/session.*
+mkdir -p "${scratch_root}/session.recent"
+clean_out="$(runner_session_prune_stale 2>&1 || true)"
+if [[ -z "$clean_out" && -d "${scratch_root}/session.recent" ]]; then
+  pass_case "prune is silent and a no-op when nothing is stale"
+else
+  fail_case "prune with no stale dirs: out='$clean_out'"
+fi
+
+# Enumeration killed by the budget still surfaces the NOTE even though nothing
+# was listed — for both the SIGTERM expiry (124) and the --kill-after SIGKILL
+# escalation (137) (repository-helpers#616 review).
+mkdir -p "${scratch_root}/session.old1"
+touch -t 202001010000 "${scratch_root}/session.old1" 2>/dev/null || true
+prune_mock_bin="$(mktemp -d)"
+for rc in 124 137; do
+  cat >"${prune_mock_bin}/timeout" <<EOF
+#!/usr/bin/env bash
+exit ${rc}
+EOF
+  chmod +x "${prune_mock_bin}/timeout"
+  enum_timeout_out="$(PATH="${prune_mock_bin}:${PATH}" runner_session_prune_stale 2>&1 || true)"
+  if grep -qF 'RUNNER_SESSION_PRUNE_INCOMPLETE' <<<"$enum_timeout_out" \
+    && [[ -d "${scratch_root}/session.old1" ]]; then
+    pass_case "prune surfaces INCOMPLETE when the enumeration is killed (exit ${rc})"
+  else
+    fail_case "prune enumeration-timeout NOTE missing (exit ${rc}): out='$enum_timeout_out'"
+  fi
+done
+rm -rf "$prune_mock_bin"
+
+# No timeout(1)/gtimeout(1) → skip the sweep entirely rather than run an
+# unbounded find that could wedge on NFS (repository-helpers#616 review).
+mkdir -p "${scratch_root}/session.notimeout"
+touch -t 202001010000 "${scratch_root}/session.notimeout" 2>/dev/null || true
+real_runner_timeout_bin="$(declare -f runner_timeout_bin)"
+runner_timeout_bin() { return 1; }
+notimeout_out="$(runner_session_prune_stale 2>&1 || true)"
+eval "$real_runner_timeout_bin"
+if [[ -z "$notimeout_out" && -d "${scratch_root}/session.notimeout" ]]; then
+  pass_case "prune skips the sweep when no timeout(1) is available"
+else
+  fail_case "prune without timeout: out='$notimeout_out'"
+fi
+
+unset RUNNER_SESSION_ROOT RUNNER_SESSION_MAX_AGE_DAYS
 rm -rf "$scratch_root"
 
 printf '\n=== runner_report: failures json and email section ===\n'
