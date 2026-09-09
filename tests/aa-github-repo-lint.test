@@ -102,6 +102,9 @@ if grep -qF 'rp_log_manual_step' "$lib" \
   && grep -qF 'rp_protect_main_create_payload' "$lib" \
   && grep -qF 'rp_check_github_merge_queue' "$lib" \
   && grep -qF 'rp_ruleset_has_github_merge_queue' "$lib" \
+  && grep -qF 'rp_ruleset_requires_signatures' "$lib" \
+  && grep -qF 'rp_validate_ruleset_required_signatures' "$lib" \
+  && grep -qF 'required_signatures' "$lib" \
   && grep -qF 'cleanup-merged-branches.yml' "$lib" \
   && grep -qF 'rp_cleanup_merged_branches_workflow_is_canonical' "$lib" \
   && grep -qF 'rp_gh_path_check' "$lib" \
@@ -1742,6 +1745,72 @@ else
   fail=$(( fail + 1 ))
 fi
 rm -rf "$mock_dir"
+
+printf '\n=== unit: protect-main required_signatures — probe + payload + patcher (repository-helpers#609) ===\n'
+rs_out="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    with_sig='"'"'{"rules":[{"type":"merge_queue"},{"type":"required_signatures"}]}'"'"'
+    without_sig='"'"'{"rules":[{"type":"merge_queue"}]}'"'"'
+    rp_ruleset_requires_signatures "$with_sig" && printf "probe_with=0\n" || printf "probe_with=1\n"
+    rp_ruleset_requires_signatures "$without_sig" && printf "probe_without=0\n" || printf "probe_without=1\n"
+    rp_protect_main_create_payload | /usr/bin/jq -e "[.rules[].type] | index(\"required_signatures\") != null" >/dev/null \
+      && printf "payload_has_sig=yes\n" || printf "payload_has_sig=no\n"
+  ' bash "$lib"
+)"
+if grep -qxF 'probe_with=0' <<<"$rs_out" \
+  && grep -qxF 'probe_without=1' <<<"$rs_out" \
+  && grep -qxF 'payload_has_sig=yes' <<<"$rs_out"; then
+  printf '[PASS] required_signatures: probe distinguishes the rule; create payload carries it\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] required_signatures probe/payload wrong\n%s\n' "$rs_out"
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== unit: rp_validate_ruleset_required_signatures — routine SUGGESTs, strict/new-repo FAIL (repository-helpers#609) ===\n'
+rs_val="$(
+  bash -c '
+    set -euo pipefail
+    # shellcheck disable=SC1091
+    source "$1"
+    rp_log_fail() { printf "FAIL:%s\n" "$1" >&2; }
+    rp_log_suggest() { printf "SUGGEST:%s\n" "$1" >&2; }
+    without_sig='"'"'{"rules":[{"type":"merge_queue"}]}'"'"'
+    with_sig='"'"'{"rules":[{"type":"merge_queue"},{"type":"required_signatures"}]}'"'"'
+    run() { local e=0; rp_validate_ruleset_required_signatures "the-hcma/x" "$1" 2>&1 || e=$?; printf "rc=%s\n" "$e"; }
+
+    printf -- "--- routine (no strict), missing, no --suggest ---\n"
+    rp_suggest=0; rp_strict_onboarding=0; rp_new_repo=0
+    run "$without_sig"
+    printf -- "--- routine --suggest, missing ---\n"
+    rp_suggest=1
+    run "$without_sig"
+    printf -- "--- strict, missing ---\n"
+    rp_suggest=0; rp_strict_onboarding=1; rp_new_repo=0
+    run "$without_sig"
+    printf -- "--- new-repo, missing ---\n"
+    rp_strict_onboarding=0; rp_new_repo=1
+    run "$without_sig"
+    printf -- "--- strict, present ---\n"
+    rp_strict_onboarding=1; rp_new_repo=0
+    run "$with_sig"
+    printf -- "--- empty ruleset json ---\n"
+    run ""
+  ' bash "$lib"
+)"
+if [[ "$(grep -c 'rc=0' <<<"$rs_val")" == 4 ]] \
+  && [[ "$(grep -c 'rc=1' <<<"$rs_val")" == 2 ]] \
+  && [[ "$(grep -c 'SUGGEST:' <<<"$rs_val")" == 1 ]] \
+  && [[ "$(grep -c 'FAIL:the-hcma/x: protect-main must include a required_signatures rule' <<<"$rs_val")" == 2 ]]; then
+  printf '[PASS] rp_validate_ruleset_required_signatures: routine SUGGEST-only (rc 0); strict / new-repo FAIL (rc 1); present + empty pass\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] rp_validate_ruleset_required_signatures ratchet wrong\n%s\n' "$rs_val"
+  fail=$(( fail + 1 ))
+fi
 
 printf '\n=== functional: git context audits only current repo ===\n'
 mock_dir="$(mktemp -d)"

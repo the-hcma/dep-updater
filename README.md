@@ -367,8 +367,8 @@ protection, branch cleanup workflows, release-age policy, license/CODEOWNERS
 metadata, cursor rules, and uv Python CVE checks.
 
 `--apply-fix` can repair supported GitHub settings such as Release Please squash
-settings, the `protect-main` ruleset (squash-only + `merge_queue` SQUASH), and
-classic `main` branch protection (GitHub MQ profile). When run from the target
+settings, the `protect-main` ruleset (squash-only + `merge_queue` SQUASH +
+`required_signatures`), and classic `main` branch protection (GitHub MQ profile). When run from the target
 repository clone, it also prepares candidate workflow fixes in a dedicated
 `.worktrees/repo-practices-candidate-fixes-wt` worktree and submits them as a
 stack for review (`gt track` / `gt submit` when the marker is `graphite`, or
@@ -385,7 +385,8 @@ also try to land PRs (stacking via `gt` / `.github/stacking-tool` is separate).
 | Check | Full audit | Merge-only | What it validates |
 | --- | --- | --- | --- |
 | Release Please squash settings | yes | yes | Repos with `release-please.yml` use squash-only merges on `main` |
-| `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding |
+| `protect-main` ruleset | yes | yes | Squash-only + GitHub `merge_queue` (`SQUASH`) + `required_signatures` on `refs/heads/main` when GitHub MQ, Release Please, or strict onboarding |
+| `protect-main` `required_signatures` | yes* | yes | Ruleset rejects any push/merge with an unverified commit (*missing FAILS `--new-repo` / `--strict-onboarding`, SUGGESTs routine `--all` / `--suggest`; `--apply-fix` adds the rule — repository-helpers#609) |
 | Classic `main` protection | yes | — | CODEOWNERS reviews, CI contexts; no Graphite-only push restrictions (GitHub MQ profile) |
 | GitHub merge queue wiring | yes | yes | `protect-main` `merge_queue`, `ci.yml` `merge_group`, dependabot auto-merge via `gh pr merge --auto` when `dependabot.yml` exists |
 | Workflow file extensions | yes | — | `.github/workflows/*` use `.yml` (not `.yaml`) |
