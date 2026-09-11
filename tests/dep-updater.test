@@ -2597,6 +2597,58 @@ else
   fail=$(( fail + 1 ))
 fi
 
+# repository-helpers#628: google-api-core 2.35.0 was yanked from PyPI but still
+# passed the age-eligible walk, so dep-updater proposed an upgrade uv's real
+# resolver refuses to select — a bump that silently never lands, forever
+# re-flagged by dep-updater-notifier. A yanked release must never surface here.
+printf '\n=== static: py-eligible version walk excludes yanked PyPI releases ===\n'
+stable_from_body_fn="$(awk '/^_pypi_stable_versions_desc_from_body\(\)/,/^\}/' "$script")"
+if grep -qF 'yanked' <<<"$stable_from_body_fn"; then
+  printf '[PASS] py-eligible: _pypi_stable_versions_desc_from_body checks the yanked flag\n'
+  pass=$(( pass + 1 ))
+else
+  printf '[FAIL] py-eligible: _pypi_stable_versions_desc_from_body must exclude yanked releases\n'
+  fail=$(( fail + 1 ))
+fi
+
+printf '\n=== behavioural: py-eligible version walk excludes yanked PyPI releases ===\n'
+if ! command -v jq >/dev/null 2>&1; then
+  printf '[SKIP] jq not on PATH — skipping yanked-release behavioural test\n'
+else
+  # PyPI records `yanked` per file (PEP 592), not per release: 2.35.0 has every
+  # file yanked (fully uninstallable, must be excluded); 2.38.0 has only one of
+  # two files yanked (still resolvable from the remaining file, must be kept)
+  # — a real-world sdist-only or single-platform-wheel yank. Reading just
+  # `.value[0].yanked` would wrongly keep 2.35.0 or drop 2.38.0 depending on
+  # array order (PR #629 review).
+  yanked_probe_json='{
+    "releases": {
+      "2.34.0": [{"yanked": false}],
+      "2.35.0": [{"yanked": true}, {"yanked": true}],
+      "2.36.0": [{"yanked": false}],
+      "2.38.0": [{"yanked": true}, {"yanked": false}],
+      "2.20.0": []
+    }
+  }'
+  yanked_probe_out="$(
+    # shellcheck disable=SC2317,SC2329  # invoked indirectly via sourced function
+    dep_runner_jq_string() { local json="$2"; local filter="$3"; jq -r "$filter" <<<"$json"; }
+    # shellcheck disable=SC1090
+    source <(awk '/^_py_version_is_stable_release\(\)/,/^\}/' "$script")
+    # shellcheck disable=SC1090
+    source <(awk '/^_pypi_stable_versions_desc_from_body\(\)/,/^\}/' "$script")
+    _pypi_stable_versions_desc_from_body "$yanked_probe_json" | tr '\n' ','
+  )"
+  if [[ "$yanked_probe_out" == '2.38.0,2.36.0,2.34.0,' ]]; then
+    printf '[PASS] py-eligible: fully-yanked 2.35.0 and file-less 2.20.0 excluded; partially-yanked 2.38.0 kept\n'
+    pass=$(( pass + 1 ))
+  else
+    printf '[FAIL] py-eligible: expected "2.38.0,2.36.0,2.34.0," (fully-yanked/empty excluded); got: %s\n' \
+      "$yanked_probe_out"
+    fail=$(( fail + 1 ))
+  fi
+fi
+
 printf '\n=== static: uv dir helpers require -- before uv subcommand ===\n'
 if ! grep -E 'dep_runner_uv_dir(_stdout|_capture|) "' "$script" \
   | grep -vE '\(\) \{|^#' \
