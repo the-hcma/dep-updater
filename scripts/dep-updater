@@ -1628,14 +1628,25 @@ _pypi_fetch_project_json() {
 }
 
 # _pypi_stable_versions_desc_from_body <json_body>
-# Prints stable published versions newest-first from a cached project JSON body.
+# Prints stable, installable published versions newest-first from a cached
+# project JSON body. PyPI yank state (PEP 592) is recorded per file, not per
+# release, so a version is only excluded when every one of its files is
+# yanked — one non-yanked file (wheel or sdist) is enough for pip/uv to still
+# resolve it. A fully yanked release is excluded from resolution by default,
+# so it must never be walked as an eligible upgrade target — uv's lock
+# resolver refuses it and the "eligible" bump silently never lands
+# (repository-helpers#628).
 _pypi_stable_versions_desc_from_body() {
   local -r body="$1"
 
   if [[ -z "$body" ]]; then
     return 1
   fi
-  dep_runner_jq_string "pypi stable versions from body" "$body" '.releases | keys[]' 2>/dev/null \
+  dep_runner_jq_string "pypi stable versions from body" "$body" \
+    '.releases | to_entries[]
+     | select((.value | length) > 0 and (.value | any((.yanked // false) | not)))
+     | .key' \
+    2>/dev/null \
     | while IFS= read -r ver; do
         [[ -z "$ver" ]] && continue
         if _py_version_is_stable_release "$ver"; then
